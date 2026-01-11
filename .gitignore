@@ -1,3 +1,4 @@
 .env
 /*.json
 /*.jsonl
+.claude/sessions/*.jsonl
