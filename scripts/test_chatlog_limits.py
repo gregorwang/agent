@@ -7,12 +7,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.chatlog.mcp_server import query_chatlog_sync  # noqa: E402
+from src.chatlog.mcp_server import compose_chatlog_query_sync  # noqa: E402
 
 
 def main() -> int:
     question = "借钱"
-    result = query_chatlog_sync(question=question, max_results=1000)
+    result = compose_chatlog_query_sync(question=question, max_results=1000)
     length = len(result or "")
 
     print(f"query length: {length}")

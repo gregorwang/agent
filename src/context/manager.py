@@ -12,6 +12,46 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 import json
+import math
+import os
+import re
+
+try:
+    import tiktoken
+except Exception:
+    tiktoken = None
+
+
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x20000 <= code <= 0x2A6DF
+        or 0x2A700 <= code <= 0x2B73F
+        or 0x2B740 <= code <= 0x2B81F
+        or 0x2B820 <= code <= 0x2CEAF
+        or 0xF900 <= code <= 0xFAFF
+        or 0x2F800 <= code <= 0x2FA1F
+        or 0x3040 <= code <= 0x309F
+        or 0x30A0 <= code <= 0x30FF
+        or 0xAC00 <= code <= 0xD7AF
+    )
+
+
+def _estimate_tokens_text(content: str) -> int:
+    if not content:
+        return 0
+    if tiktoken is not None:
+        try:
+            encoder = tiktoken.get_encoding("cl100k_base")
+            return len(encoder.encode(content))
+        except Exception:
+            pass
+    cjk_count = sum(1 for ch in content if _is_cjk_char(ch))
+    non_cjk_count = len(content) - cjk_count
+    estimate = cjk_count * 1.8 + non_cjk_count * 0.25
+    return max(1, int(math.ceil(estimate)))
 
 
 @dataclass
@@ -25,8 +65,7 @@ class Message:
 
     def __post_init__(self):
         if self.token_estimate == 0:
-            # Rough estimate: ~4 chars per token for English
-            self.token_estimate = len(self.content) // 4 + 1
+            self.token_estimate = _estimate_tokens_text(self.content)
 
     def to_dict(self) -> dict:
         return {
@@ -73,27 +112,34 @@ class ContextManager:
         model: str = "default",
         compact_threshold: float = 0.8,
         keep_recent: int = 10,
+        auto_save_path: str | None = None,
     ):
         """
         Initialize the context manager.
 
         Args:
-            max_tokens: Maximum tokens to allow (uses model default if None)
+            max_tokens: Maximum tokens to allow (uses model default if None)    
             model: Model name for determining token limits
             compact_threshold: Compact when this % of limit is reached (0.0-1.0)
-            keep_recent: Number of recent messages to keep when compacting
+            keep_recent: Number of recent messages to keep when compacting      
+            auto_save_path: Optional path to auto-save and restore context
         """
         self.max_tokens = max_tokens or self.MODEL_LIMITS.get(
             model, self.MODEL_LIMITS["default"]
         )
         self.compact_threshold = compact_threshold
         self.keep_recent = keep_recent
+        self.auto_save_path = auto_save_path
 
         self.messages: list[Message] = []
         self.summary: str = ""
         self.summary_token_estimate: int = 0
         self.total_messages_processed: int = 0
         self.compaction_count: int = 0
+
+        if self.auto_save_path and os.path.exists(self.auto_save_path):
+            loaded = self.load_from_file(self.auto_save_path)
+            self._restore_state(loaded)
 
     @property
     def current_tokens(self) -> int:
@@ -140,6 +186,9 @@ class ContextManager:
         if self.should_compact:
             self._compact()
 
+        if self.auto_save_path:
+            self.save_to_file(self.auto_save_path)
+
         return message
 
     def add_user_message(self, content: str, **metadata) -> Message:
@@ -176,7 +225,7 @@ class ContextManager:
         else:
             self.summary = old_summary
 
-        self.summary_token_estimate = len(self.summary) // 4 + 1
+        self.summary_token_estimate = _estimate_tokens_text(self.summary)
         self.compaction_count += 1
 
     def _generate_summary(self, messages: list[Message]) -> str:
@@ -186,15 +235,149 @@ class ContextManager:
         Note: This is a simple extraction. In production, you'd want to
         use Claude to generate a proper summary.
         """
+        if not messages:
+            return "[Conversation summary - 0 messages]"
+
+        start_time = min(m.timestamp for m in messages).astimezone(timezone.utc)
+        end_time = max(m.timestamp for m in messages).astimezone(timezone.utc)
+        time_range = (
+            f"{start_time.strftime('%Y-%m-%d %H:%M UTC')} to "
+            f"{end_time.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
+        decisions = []
+        issues = []
+        questions = []
+        conclusions = []
+        code_blocks = []
+
+        decision_keywords = (
+            "decide",
+            "decision",
+            "we will",
+            "will use",
+            "choose",
+            "selected",
+            "adopt",
+        )
+        issue_keywords = (
+            "error",
+            "issue",
+            "bug",
+            "problem",
+            "failed",
+        )
+        conclusion_keywords = (
+            "conclusion",
+            "result",
+            "therefore",
+            "so ",
+            "resolved",
+            "fixed",
+            "done",
+        )
+
+        def iter_sentences(text: str) -> list[str]:
+            parts = re.split(r"[\n]+", text)
+            sentences = []
+            for part in parts:
+                buf = []
+                for ch in part:
+                    buf.append(ch)
+                    code = ord(ch)
+                    if ch in ".!?" or code in (0x3002, 0xFF01, 0xFF1F):
+                        sentence = "".join(buf).strip()
+                        if sentence:
+                            sentences.append(sentence)
+                        buf = []
+                tail = "".join(buf).strip()
+                if tail:
+                    sentences.append(tail)
+            return sentences
+
+        def has_question_mark(text: str) -> bool:
+            for ch in text:
+                if ch == "?" or ord(ch) == 0xFF1F:
+                    return True
+            return False
+
+        for msg in messages:
+            for block in re.findall(r"```.*?```", msg.content, flags=re.S):
+                if block not in code_blocks:
+                    code_blocks.append(block)
+
+            lines = msg.content.splitlines()
+            if msg.role == "user":
+                for line in lines:
+                    if has_question_mark(line):
+                        questions.append(line.strip())
+                    if any(k in line.lower() for k in issue_keywords):
+                        issues.append(line.strip())
+
+            for sentence in iter_sentences(msg.content):
+                lowered = sentence.lower()
+                if any(k in lowered for k in decision_keywords):
+                    decisions.append(sentence)
+                if msg.role == "assistant" and any(k in lowered for k in conclusion_keywords):
+                    conclusions.append(sentence)
+                if msg.role != "user" and any(k in lowered for k in issue_keywords):
+                    issues.append(sentence)
+
+        def clamp_items(items: list[str], limit: int = 6) -> list[str]:
+            seen = []
+            for item in items:
+                cleaned = item.strip()
+                if not cleaned:
+                    continue
+                if cleaned not in seen:
+                    seen.append(cleaned)
+                if len(seen) >= limit:
+                    break
+            return seen
+
         summary_parts = [
-            f"[Conversation summary - {len(messages)} messages compacted]"
+            f"[Conversation summary - {len(messages)} messages from {time_range}]"
         ]
 
-        # Extract key points from each message
-        for msg in messages:
-            # Truncate long messages
-            content = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
-            summary_parts.append(f"- {msg.role}: {content}")
+        summary_parts.append("Key decisions:")
+        decisions = clamp_items(decisions)
+        if decisions:
+            summary_parts.extend(f"- {d}" for d in decisions)
+        else:
+            summary_parts.append("- None noted.")
+
+        summary_parts.append("Issues:")
+        issues = clamp_items(issues)
+        if issues:
+            summary_parts.extend(f"- {i}" for i in issues)
+        else:
+            summary_parts.append("- None noted.")
+
+        summary_parts.append("Questions:")
+        questions = clamp_items(questions)
+        if questions:
+            summary_parts.extend(f"- {q}" for q in questions)
+        else:
+            summary_parts.append("- None noted.")
+
+        summary_parts.append("Conclusions:")
+        conclusions = clamp_items(conclusions)
+        if conclusions:
+            summary_parts.extend(f"- {c}" for c in conclusions)
+        else:
+            summary_parts.append("- None noted.")
+
+        summary_parts.append("Code blocks:")
+        trimmed_blocks = []
+        for block in code_blocks[:3]:
+            if len(block) > 500:
+                trimmed_blocks.append(block[:500] + "...")
+            else:
+                trimmed_blocks.append(block)
+        if trimmed_blocks:
+            summary_parts.extend(trimmed_blocks)
+        else:
+            summary_parts.append("- None noted.")
 
         return "\n".join(summary_parts)
 
@@ -259,30 +442,33 @@ Provide a concise summary in bullet points."""
 
         return "\n\n".join(parts)
 
-    def get_messages_for_api(self) -> list[dict]:
+    def get_messages_for_api(self) -> tuple[str | None, list[dict]]:
         """
         Get messages formatted for API calls.
 
         Returns:
-            List of message dictionaries
+            Tuple of system prompt and list of message dictionaries
         """
-        messages = []
+        system_parts = []
 
-        # Add summary as system message if exists
         if self.summary:
-            messages.append({
-                "role": "system",
-                "content": f"Previous conversation summary:\n{self.summary}"
-            })
+            system_parts.append(
+                f"Previous conversation summary:\n{self.summary}"
+            )
 
-        # Add recent messages
         for msg in self.messages:
-            messages.append({
-                "role": msg.role,
-                "content": msg.content
-            })
+            if msg.role == "system":
+                system_parts.append(msg.content)
 
-        return messages
+        system_prompt = "\n\n".join(system_parts) if system_parts else None
+
+        messages = [
+            {"role": msg.role, "content": msg.content}
+            for msg in self.messages
+            if msg.role != "system"
+        ]
+
+        return system_prompt, messages
 
     def clear(self) -> None:
         """Clear all context including summary."""
@@ -300,7 +486,7 @@ Provide a concise summary in bullet points."""
             self.messages = []
             new_summary = self._generate_summary(old_messages)
             self.summary = f"{self.summary}\n\n---\n\n{new_summary}"
-            self.summary_token_estimate = len(self.summary) // 4 + 1
+            self.summary_token_estimate = _estimate_tokens_text(self.summary)
 
     def get_stats(self) -> dict:
         """Get statistics about the context."""
@@ -341,6 +527,16 @@ Provide a concise summary in bullet points."""
         cm.total_messages_processed = data.get("total_messages_processed", 0)
         cm.compaction_count = data.get("compaction_count", 0)
         return cm
+
+    def _restore_state(self, other: "ContextManager") -> None:
+        self.messages = other.messages
+        self.summary = other.summary
+        self.summary_token_estimate = other.summary_token_estimate
+        self.total_messages_processed = other.total_messages_processed
+        self.compaction_count = other.compaction_count
+        self.max_tokens = other.max_tokens
+        self.compact_threshold = other.compact_threshold
+        self.keep_recent = other.keep_recent
 
     def save_to_file(self, path: str) -> None:
         """Save context to a JSON file."""

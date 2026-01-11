@@ -13,8 +13,9 @@ from .cleaner import ChatlogCleaner
 from .mcp_server import (
     create_chatlog_mcp_server,
     get_chatlog_tools_info,
-    query_chatlog_sync,
     get_chatlog_stats_sync,
+    close_chatlog_clients,
+    compose_chatlog_query_sync,
 )
 
 __all__ = [
@@ -25,7 +26,8 @@ __all__ = [
     "ChatlogCleaner",
     "create_chatlog_mcp_server",
     "get_chatlog_tools_info",
-    "query_chatlog_sync",
     "get_chatlog_stats_sync",
+    "close_chatlog_clients",
+    "compose_chatlog_query_sync",
 ]
 

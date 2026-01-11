@@ -249,22 +249,29 @@ Memories are stored in: `~/.benedictjun/memories.json`
 
 ## Chatlog Retrieval System
 
-Intelligent chatlog retrieval with keyword expansion and context-aware search.
+Intelligent chatlog retrieval with agent-composed, atomic tools.
 
 ### How It Works
 
-1. **Keyword Expansion**: Uses Gemini-2.5-Flash-Lite (Poe API) to expand query into 10 related keywords
-2. **Context Window**: Extracts ±5 messages around each match to preserve conversation flow
-3. **Smart Cleaning**: If results exceed 3000 chars, uses small model to filter relevant content
-4. **Person Focus**: Can prioritize messages from/about a specific person
+1. **Keyword Expansion (optional)**: Expand a query into keywords/topics
+2. **Topic/Semantic Search**: Retrieve line numbers using index or embeddings
+3. **Context Window**: Load nearby messages for conversation context
+4. **Person Focus (optional)**: Filter messages to target a specific person
 
 ### MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `mcp__chatlog__query_chatlog` | Intelligent search with keyword expansion |
 | `mcp__chatlog__get_chatlog_stats` | Get statistics about loaded chatlog |
 | `mcp__chatlog__search_person` | Search messages from a specific person |
+| `mcp__chatlog__list_topics` | List available topics |
+| `mcp__chatlog__search_by_topics` | Find line numbers by topics |
+| `mcp__chatlog__search_by_keywords` | Find line numbers by keywords |
+| `mcp__chatlog__load_messages` | Load messages by line numbers |
+| `mcp__chatlog__expand_query` | Expand question into keywords/topics |
+| `mcp__chatlog__search_semantic` | Semantic search by embeddings |
+| `mcp__chatlog__filter_by_person` | Filter messages by target person |
+| `mcp__chatlog__format_messages` | Format messages for display |
 
 ### Chatlog Commands
 

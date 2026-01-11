@@ -27,8 +27,8 @@ from .chatlog import (
     ChatlogCleaner,
     create_chatlog_mcp_server,
     get_chatlog_tools_info,
-    query_chatlog_sync,
     get_chatlog_stats_sync,
+    compose_chatlog_query_sync,
 )
 
 # UI components
@@ -65,8 +65,8 @@ __all__ = [
     "ChatlogCleaner",
     "create_chatlog_mcp_server",
     "get_chatlog_tools_info",
-    "query_chatlog_sync",
     "get_chatlog_stats_sync",
+    "compose_chatlog_query_sync",
     # UI
     "ToolApprovalPrompt",
     "SelectionMenu",

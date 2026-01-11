@@ -32,6 +32,7 @@ from claude_agent_sdk.types import (
 )
 from dotenv import load_dotenv
 from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PromptStyle
@@ -66,7 +67,6 @@ from src.ui.components import (
     ApprovalResult,
 )
 from src.ui.styles import COLORS, STYLES as UI_STYLES
-from src.router import ModelRouter, get_router, TaskType
 from src.skills import SkillManager, get_skill_manager
 from src.memory import (
     MemoryStorage,
@@ -76,8 +76,7 @@ from src.memory import (
     get_memory_extractor
 )
 from src.agents.react import ReActController, ReActTrace, run_react
-from src.chatlog import create_chatlog_mcp_server
-from src.chatlog.trigger import should_use_chatlog_chain
+from src.chatlog import create_chatlog_mcp_server, close_chatlog_clients
 from src.commands import CommandDispatcher, AppState, CommandResult
 
 
@@ -96,14 +95,20 @@ CONTEXT_PATH = Path("context_state.json")
 
 VERSION = "0.5.0"
 
+# Session timing + mode display
+session_start_time = datetime.now(timezone.utc)
+current_mode_label = "Auto"
+
 # P2 Fix: Connection retry settings
 MAX_RECONNECT_ATTEMPTS = 3
 RECONNECT_DELAY_BASE = 1.0  # Base delay in seconds, will be multiplied exponentially
 QUERY_TIMEOUT = 300  # 5 minutes timeout for queries
-RESPONSE_IDLE_TIMEOUT = 120  # Stop waiting if no new stream events arrive
+RESPONSE_IDLE_TIMEOUT = 120  # Stop waiting if no new stream events arrive      
 RESPONSE_TOTAL_TIMEOUT = 300  # Hard stop for response streaming
 
 console = Console()
+
+pending_compaction_notice: str | None = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -204,7 +209,6 @@ COMMANDS_META = {
     "/save": "Save config",
     "/history": "Show history path",
     "/permissions": "Manage tool permissions",
-    "/route": "Dynamic model routing",
     "/memory": "Manage user memories",
     "/react": "ReAct reasoning mode",
     "/chatlog": "Query chatlog history",
@@ -240,12 +244,21 @@ def save_session_id(session_id: str) -> None:
 
 def append_history(role: str, content: str) -> None:
     """Append a message to the history file, context manager, and session transcript."""
+    global pending_compaction_notice
     # P1 Fix: Also track in context manager
+    prev_compaction = context_manager.compaction_count
+    prev_len = len(context_manager.messages)
     if role == "user":
         context_manager.add_user_message(content)
     elif role == "assistant":
         context_manager.add_assistant_message(content)
-    
+
+    if context_manager.compaction_count > prev_compaction:
+        compacted_count = max(0, prev_len + 1 - context_manager.keep_recent)
+        pending_compaction_notice = (
+            f"⚠️  Context compacted: {compacted_count} messages summarized"
+        )
+
     # NEW: Save to session transcript (per-session JSONL file)
     current_session = session_manager.get_current_session_id()
     if current_session:
@@ -271,7 +284,11 @@ def get_default_tools() -> list[str]:
         "Read,Edit,Write,Glob,Grep,Bash,Task,"
         "mcp__web__web_search,mcp__web__web_fetch,"
         "mcp__memory__recall_memory,mcp__memory__remember,mcp__memory__get_user_profile,"
-        "mcp__chatlog__query_chatlog,mcp__chatlog__get_chatlog_stats,mcp__chatlog__search_person"
+        "mcp__chatlog__get_chatlog_stats,mcp__chatlog__search_person,"
+        "mcp__chatlog__list_topics,mcp__chatlog__search_by_topics,"
+        "mcp__chatlog__search_by_keywords,mcp__chatlog__load_messages,"
+        "mcp__chatlog__expand_query,mcp__chatlog__search_semantic,"
+        "mcp__chatlog__filter_by_person,mcp__chatlog__format_messages"
     )
     tools = os.getenv("ALLOWED_TOOLS", default).split(",")
     return [tool.strip() for tool in tools if tool.strip()]
@@ -395,6 +412,80 @@ def print_slash_hints() -> None:
         grid.add_row(cmd, desc)
     console.print(grid)
     console.print(Text("─" * console.width, style="dim white"))
+
+
+def _get_context_status_color(usage_ratio: float) -> str:
+    if usage_ratio < 0.6:
+        return COLORS["success"]
+    if usage_ratio < 0.75:
+        return COLORS["warning"]
+    if usage_ratio < 0.9:
+        return COLORS["primary"]
+    return COLORS["error"]
+
+
+def _format_elapsed_time(started_at: datetime) -> str:
+    elapsed = datetime.now(timezone.utc) - started_at
+    total_seconds = int(elapsed.total_seconds())
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    return f"{minutes}m {seconds}s"
+
+
+def _format_context_status_bar() -> Text:
+    global current_mode_label
+    stats = context_manager.get_stats()
+    usage_ratio = max(0.0, min(stats.get("usage_ratio", 0.0), 1.0))        
+    current_tokens = stats.get("current_tokens", 0)
+    max_tokens = stats.get("max_tokens", 0)
+    message_count = stats.get("message_count", 0)
+
+    bar_length = 10
+    filled = min(bar_length, int(round(usage_ratio * bar_length)))
+    bar = "█" * filled + "░" * (bar_length - filled)
+    percent = int(round(usage_ratio * 100))
+    left = (
+        f"Context: {percent}% ({current_tokens:,}/{max_tokens:,} tokens) "
+        f"[{bar}] {message_count} msgs"
+        f" • Mode: {current_mode_label}"
+    )
+    right = f"⏱️ {_format_elapsed_time(session_start_time)}"
+    width = max(0, console.width)
+    padding = max(1, width - len(left) - len(right))
+    line = f"{left}{' ' * padding}{right}"
+    return Text(line, style=_get_context_status_color(usage_ratio))        
+
+
+def _render_context_status_bar() -> None:
+    global pending_compaction_notice
+    console.print(_format_context_status_bar())
+    if pending_compaction_notice:
+        console.print(f"[{COLORS['warning']}]{pending_compaction_notice}[/{COLORS['warning']}]")
+        pending_compaction_notice = None
+
+
+def _build_context_detail_panel() -> Panel:
+    stats = context_manager.get_stats()
+    usage_ratio = max(0.0, min(stats.get("usage_ratio", 0.0), 1.0))
+    percent = int(round(usage_ratio * 100))
+
+    table = Table(show_header=False, box=MINIMAL, padding=(0, 1))
+    table.add_column("Key", style=COLORS["muted"])
+    table.add_column("Value", style=COLORS["text"], justify="right")
+    table.add_row("Usage", f"{percent}%")
+    table.add_row("Tokens", f"{stats.get('current_tokens', 0):,}")
+    table.add_row("Max tokens", f"{stats.get('max_tokens', 0):,}")
+    table.add_row("Messages (current)", str(stats.get("message_count", 0)))
+    table.add_row("Messages (total)", str(stats.get("total_processed", 0)))
+    table.add_row("Compactions", str(stats.get("compaction_count", 0)))
+    table.add_row("Keep recent", str(context_manager.keep_recent))
+    table.add_row("Compact threshold", f"{context_manager.compact_threshold:.0%}")
+    table.add_row("Summary tokens", f"{context_manager.summary_token_estimate:,}")
+
+    title = "Context Details (Ctrl+I)"
+    return Panel(table, title=title, title_align="left", border_style=COLORS["primary"])
 
 
 def count_quote_lines(text: str) -> int:
@@ -595,7 +686,7 @@ async def run_query(
     prompt: str,
     session_id: str,
     show_thinking: bool = False,
-    thinking_budget: int = 0
+    thinking_budget: int = 0,
 ) -> None:
     """
     Execute a query and display results in BENEDICTJUN style.
@@ -840,7 +931,10 @@ async def run_query_collect(
                     stats.input_tokens += getattr(message.usage, 'input_tokens', 0)
                     stats.output_tokens += getattr(message.usage, 'output_tokens', 0)
                 if message.result:
-                    result_text = message.result
+                    if result_text:
+                        result_text = f"{result_text}\n{message.result}"
+                    else:
+                        result_text = message.result
                 break
 
     except asyncio.TimeoutError:
@@ -891,10 +985,12 @@ async def main() -> None:
     mouse_support_value = config.get("mouse_support", os.getenv("MOUSE_SUPPORT", "0"))
     mouse_support = str(mouse_support_value).lower() in {"1", "true", "on", "yes"}
     
-    # P0 Fix: Use global session_manager (already initialized at module level)
-    # Force new session structure on startup to avoid inheriting old context
+    # P0 Fix: Use global session_manager (already initialized at module level)  
+    # Force new session structure on startup to avoid inheriting old context    
     # User expects new window = new session
     resume_session_id = session_manager.create_session()
+    global session_start_time
+    session_start_time = datetime.now(timezone.utc)
 
     
     # P1 Fix: Initialize context manager with correct model
@@ -912,6 +1008,8 @@ async def main() -> None:
     reconnect = True
     current_continue_conversation: Optional[bool] = None
     react_mode = False  # ReAct reasoning mode toggle
+    global current_mode_label
+    current_mode_label = "Auto"
     
     # === NEW: Initialize AppState for command handlers ===
     app_state = AppState(
@@ -949,23 +1047,37 @@ async def main() -> None:
         meta_dict=COMMANDS_META,
     )
 
+    kb = KeyBindings()
+
+    @kb.add("c-i")
+    def _show_context_info(event) -> None:
+        def _show() -> None:
+            console.print(_build_context_detail_panel())
+        event.app.run_in_terminal(_show)
+
     session = PromptSession(
         style=prompt_style,
         completer=completer,
         complete_while_typing=True,
+        key_bindings=kb,
         mouse_support=mouse_support
     )
-    
+
     while True:
+        _render_context_status_bar()
         try:
             with patch_stdout():
+                prompt_label = f'[INPUT] ❯ '
+                pad = max(0, (console.width - len(prompt_label)) // 2)
+                prompt_text = f"{' ' * pad}<style fg=\"{COLORS['primary']}\">[INPUT]</style> ❯ "
                 text = await session.prompt_async(
-                    HTML(f'<style fg="{COLORS["primary"]}">[INPUT]</style> ❯ '),
+                    HTML(prompt_text),
                     bottom_toolbar=HTML(
                         ' <style bg="#333333" fg="#ffffff"><b> / </b></style> Menu '
                         ' <style bg="#333333" fg="#ffffff"><b> ↑/↓ </b></style> Navigate '
                         ' <style bg="#333333" fg="#ffffff"><b> Enter </b></style> Select '
                         ' <style bg="#333333" fg="#ffffff"><b> Esc </b></style> Cancel '
+                        ' <style bg="#333333" fg="#ffffff"><b> Ctrl+I </b></style> Info '
                     ),
                 )
         except (EOFError, KeyboardInterrupt):
@@ -1207,7 +1319,7 @@ async def main() -> None:
             
             if command == "/chatlog":
                 # /chatlog [query|stats|person] [args]
-                from src.chatlog import query_chatlog_sync, get_chatlog_stats_sync
+                from src.chatlog import compose_chatlog_query_sync, get_chatlog_stats_sync
                 from src.chatlog.loader import get_chatlog_loader
                 
                 subparts = arg.strip().split(maxsplit=1)
@@ -1230,7 +1342,7 @@ async def main() -> None:
                             chatlog_arg = parts[0].strip()
                             target_person = parts[1].split()[0] if parts[1] else None
                         
-                        result = query_chatlog_sync(
+                        result = compose_chatlog_query_sync(
                             question=chatlog_arg,
                             target_person=target_person,
                             max_results=100
@@ -1293,11 +1405,13 @@ async def main() -> None:
                 
                 if subcommand == "on":
                     react_mode = True
+                    current_mode_label = "ReAct"
                     console.print(f"[{COLORS['success']}]✓ ReAct mode enabled[/{COLORS['success']}]")
                     console.print(f"[dim]All queries will use Thought → Action → Observation loop[/dim]")
                 
                 elif subcommand == "off":
                     react_mode = False
+                    current_mode_label = "Auto"
                     console.print(f"[{COLORS['success']}]✓ ReAct mode disabled[/{COLORS['success']}]")
                 
                 elif subcommand == "goal" and goal_text:
@@ -1348,56 +1462,6 @@ async def main() -> None:
                 
                 continue
             
-            if command == "/route":
-                # /route [auto|manual|test|info] [test_prompt]
-                router = get_router()
-                subparts = arg.strip().split(maxsplit=1)
-                subcommand = subparts[0].lower() if subparts else "info"
-                test_prompt = subparts[1] if len(subparts) > 1 else ""
-                
-                if subcommand == "auto":
-                    router.enabled = True
-                    console.print(f"[{COLORS['success']}]✓ 自动路由已启用[/{COLORS['success']}]")
-                
-                elif subcommand == "manual":
-                    router.enabled = False
-                    console.print(f"[{COLORS['success']}]✓ 手动模式，使用 /model 切换[/{COLORS['success']}]")
-                
-                elif subcommand == "test":
-                    if test_prompt:
-                        decision = router.route(test_prompt)
-                        task_emoji = {
-                            TaskType.MATH: "🔢",
-                            TaskType.CODE: "💻",
-                            TaskType.REASONING: "🧠",
-                            TaskType.TOOL_USE: "🔧",
-                            TaskType.CHAT: "💬",
-                        }.get(decision.task_type, "📍")
-                        console.print(f"[cyan]测试输入:[/cyan] {test_prompt[:50]}...")
-                        console.print(f"[cyan]路由结果:[/cyan] {task_emoji} {decision.model}")
-                        console.print(f"[cyan]原因:[/cyan] {decision.reason}")
-                        console.print(f"[cyan]支持工具:[/cyan] {'是' if decision.supports_tools else '否'}")
-                        console.print(f"[cyan]置信度:[/cyan] {decision.confidence:.0%}")
-                    else:
-                        console.print(f"[{COLORS['warning']}]用法: /route test <测试提示词>[/{COLORS['warning']}]")
-                
-                elif subcommand == "info" or not subcommand:
-                    status = "启用" if router.enabled else "禁用"
-                    console.print(f"[cyan]自动路由:[/cyan] {status}")
-                    console.print(f"[cyan]当前模型:[/cyan] {model}")
-                    console.print()
-                    # Show model info
-                    for m in [router.MODEL_REASONER, router.MODEL_CHAT]:
-                        info = router.get_model_info(m)
-                        marker = "→ " if m == model else "  "
-                        console.print(f"{marker}[bold]{info['name']}[/bold]")
-                        console.print(f"   {info['description']}")
-                        console.print(f"   工具支持: {'✓' if info['supports_tools'] else '✗'}")
-                
-                else:
-                    console.print(f"[{COLORS['warning']}]用法: /route [auto|manual|test|info][/{COLORS['warning']}]")
-                
-                continue
             
             if command == "/permissions":
                 # /permissions [add|remove|list] [tool_name]
@@ -1446,8 +1510,8 @@ async def main() -> None:
                 
                 continue
             
-            if command in ("/clear", "/cls"):
-                context_manager.clear()
+                if command in ("/clear", "/cls"):
+                    context_manager.clear()
                 # CRITICAL: Reset client to force new session with zero context
                 if client:
                     try:
@@ -1457,8 +1521,9 @@ async def main() -> None:
                     client = None
                 reconnect = True
                 # Create brand new session ID
-                resume_session_id = session_manager.create_session()
-                os.system("cls" if os.name == "nt" else "clear")
+                    resume_session_id = session_manager.create_session()
+                    session_start_time = datetime.now(timezone.utc)
+                    os.system("cls" if os.name == "nt" else "clear")
                 print_dashboard(model)
                 console.print(f"[{COLORS['success']}]✓ 上下文已清除，新会话: {resume_session_id[:16]}...[/{COLORS['success']}]")
                 continue
@@ -1475,29 +1540,8 @@ async def main() -> None:
         
         # Save original text for memory extraction (before skill injection modifies it)
         original_text = text
-        chatlog_task_chain = False
-        chatlog_question = original_text
-        
-        # NEW: Chatlog trigger detection - auto-inject prompt for evidence-based queries
-        if should_use_chatlog_chain(text):
-            console.print(f"[{COLORS['secondary']}]🔍 检测到需要历史证据的问题，将自动查询聊天记录[/{COLORS['secondary']}]")
-            chatlog_task_chain = True
-            chatlog_question = original_text
-            text = f"""## 重要提示
-你需要先调用 mcp__chatlog__query_chatlog 工具来查询相关的聊天记录，
-然后基于查询结果给出有证据支持的分析。
-在最终回答中必须引用具体的对话片段作为证据，使用markdown引用格式：
-> [时间] 发送者: 内容
-调用工具时，question 参数必须使用用户原话，不要自行扩展关键词或场景。
-需要进行两轮检索：第一轮寻找支持结论的证据，第二轮主动寻找相反证据并解释冲突点。
-
-强制使用 Task 子代理链：
-1) 调用 Task 子代理 chatlog-searcher，输入必须包含原始用户问题。
-2) 调用 Task 子代理 chatlog-refuter，输入必须包含原始用户问题。
-3) 调用 Task 子代理 chatlog-synthesizer，输入包含前两步的原始输出，用于综合结论。
-
-## 用户问题
-{text}"""
+        # REMOVED: Forced chatlog trigger detection and prompt injection
+        # Agent now decides autonomously whether to use chatlog tools
 
         # NEW: Skill activation (explicit only; no auto-matching)
         if skill_manager.active_skill:
@@ -1505,37 +1549,15 @@ async def main() -> None:
             console.print(f"[{COLORS['secondary']}]📚 Using skill: {skill_manager.active_skill.name}[/{COLORS['secondary']}]")
             text = f"{skill_injection}\n\n---\n\n## User Request:\n{text}"
         
-        # NEW: Dynamic model routing based on task type
-        router = get_router()
-        decision = router.route(text, require_tools=chatlog_task_chain)
-        routed_model = decision.model
-        routed_tools = allowed_tools if decision.supports_tools else []
-        effective_continue_conversation = (
-            False if chatlog_task_chain else continue_conversation
-        )
+        # Agent-autonomous mode: use configured model with all tools
+        # No routing logic - Agent decides which tools to use
+        routed_model = model
+        routed_tools = allowed_tools  # All tools available
+        effective_continue_conversation = continue_conversation
         
-        # Display routing decision
-        task_emoji = {
-            TaskType.MATH: "🔢",
-            TaskType.CODE: "💻",
-            TaskType.REASONING: "🧠",
-            TaskType.TOOL_USE: "🔧",
-            TaskType.CHAT: "💬",
-        }.get(decision.task_type, "📍")
-        console.print(f"[{COLORS['muted']}]{task_emoji} {decision.reason}[/{COLORS['muted']}]")
-        
-        # Check if model/continue behavior changed and needs reconnection
-        if routed_model != model:
-            model = routed_model
-            reconnect = True
-        if current_continue_conversation is None or (
-            current_continue_conversation != effective_continue_conversation
-        ):
-            reconnect = True
+        # No routing display - Agent is fully autonomous
         
         effective_max_turns = max_turns
-        if chatlog_task_chain:
-            effective_max_turns = max(max_turns, chatlog_max_turns)
 
         if reconnect or client is None:
             if client:
@@ -1545,21 +1567,19 @@ async def main() -> None:
                     pass
             
             # P0 Fix: Include agents in options for subagent support
-            # Use routed model and tools
-            # Build MCP servers dict - include memory and chatlog for all, web for tool-capable models
+            # All MCP servers and subagents are always available
             mcp_servers = {
                 "memory": create_memory_mcp_server(),
                 "chatlog": create_chatlog_mcp_server(),
+                "web": create_web_mcp_server(),
             }
-            if decision.supports_tools:
-                mcp_servers["web"] = create_web_mcp_server()
             
             options = ClaudeAgentOptions(
                 model=model,
                 max_turns=effective_max_turns,
                 allowed_tools=routed_tools,
                 continue_conversation=effective_continue_conversation,
-                agents=AGENT_DEFINITIONS if decision.supports_tools else {},  # No subagents for R1
+                agents=AGENT_DEFINITIONS,  # Subagents always available
                 resume=None,  # Fresh session - no context inheritance from previous windows
                 mcp_servers=mcp_servers,
             )
@@ -1574,110 +1594,6 @@ async def main() -> None:
             reconnect = False
             current_continue_conversation = effective_continue_conversation
         
-        if chatlog_task_chain:
-            console.print(f"[{COLORS['secondary']}]🧩 Running chatlog task chain[/{COLORS['secondary']}]")
-            console.print(f"[{COLORS['muted']}]Step 1/3: chatlog-searcher[/{COLORS['muted']}]")
-            search_prompt = (
-                "Call Task subagent chatlog-searcher.\n"
-                "<QUESTION>\n"
-                f"{chatlog_question}\n"
-                "</QUESTION>"
-            )
-            search_output, search_stats = await run_query_collect(
-                client,
-                search_prompt,
-                session_id=resume_session_id,
-                show_thinking=show_thinking,
-                thinking_budget=thinking_budget,
-                return_stats=True,
-                show_progress=True
-            )
-            if search_output:
-                console.print(Markdown("#### chatlog-searcher 输出\n" + truncate_text(search_output, 2000)))
-            evidence_score = count_quote_lines(search_output)
-            evidence_note = (
-                "证据较弱，注意结论不确定性。"
-                if evidence_score < 2 else "证据充足。"
-            )
-
-            refuter_session_id = session_manager.fork_session(resume_session_id, name="Chatlog refuter")
-            console.print(f"[{COLORS['muted']}]Step 2/3: chatlog-refuter[/{COLORS['muted']}]")
-            refute_prompt = (
-                "Call Task subagent chatlog-refuter.\n"
-                "<QUESTION>\n"
-                f"{chatlog_question}\n"
-                "</QUESTION>"
-            )
-            refute_output, refute_stats = await run_query_collect(
-                client,
-                refute_prompt,
-                session_id=refuter_session_id,
-                show_thinking=show_thinking,
-                thinking_budget=thinking_budget,
-                return_stats=True,
-                show_progress=True
-            )
-            if refute_output:
-                console.print(Markdown("#### chatlog-refuter 输出\n" + truncate_text(refute_output, 2000)))
-
-            # Truncate outputs to prevent context overflow (max 500 chars each)
-            def _truncate(text: str, max_chars: int = 500) -> str:
-                if not text or len(text) <= max_chars:
-                    return text or ""
-                return text[:max_chars] + "\n...(已截断)"
-            
-            search_truncated = _truncate(search_output, 500)
-            refute_truncated = _truncate(refute_output, 500)
-            
-            synth_prompt = (
-                "Call Task subagent chatlog-synthesizer.\n\n"
-                f"User question: {chatlog_question}\n\n"
-                f"Evidence strength: {evidence_note}\n\n"
-                "Evidence (truncated):\n"
-                f"{search_truncated}\n\n"
-                "Counter-evidence (truncated):\n"
-                f"{refute_truncated}"
-            )
-            console.print(f"[{COLORS['muted']}]Step 3/3: chatlog-synthesizer[/{COLORS['muted']}]")
-            final_output, synth_stats = await run_query_collect(
-                client,
-                synth_prompt,
-                session_id=resume_session_id,
-                show_thinking=show_thinking,
-                thinking_budget=thinking_budget,
-                return_stats=True,
-                show_progress=True
-            )
-
-            if final_output:
-                console.print(Markdown("#### chatlog-synthesizer 输出"))
-                format_final_result(final_output)
-                append_history("assistant", final_output)
-            else:
-                fallback_parts = [
-                    "未能生成综合结论（模型未返回结果或响应超时）。",
-                ]
-                if search_output or refute_output:
-                    fallback_parts.append("\n证据（截断）：\n")
-                    fallback_parts.append(truncate_text(search_output))
-                    fallback_parts.append("\n反证（截断）：\n")
-                    fallback_parts.append(truncate_text(refute_output))
-                fallback_text = "\n".join(fallback_parts).strip()
-                format_final_result(fallback_text)
-                append_history("assistant", fallback_text)
-            def _print_step_stats(label: str, stats: QueryStats) -> None:
-                tool_names = ", ".join(sorted(set(stats.tool_names))) if stats.tool_names else "-"
-                console.print(
-                    f"[dim]{label}: tools={stats.tool_calls} ({tool_names}) · "
-                    f"time={stats.duration_seconds:.1f}s · "
-                    f"tokens={stats.input_tokens}/{stats.output_tokens}[/dim]"
-                )
-            _print_step_stats("searcher", search_stats)
-            _print_step_stats("refuter", refute_stats)
-            _print_step_stats("synthesizer", synth_stats)
-            total_time = search_stats.duration_seconds + refute_stats.duration_seconds + synth_stats.duration_seconds
-            console.print(f"[dim]subagent_chain=chatlog-evidence total_time={total_time:.1f}s[/dim]")
-            continue
 
         # Check if ReAct mode is enabled
         if react_mode:
@@ -1689,6 +1605,7 @@ async def main() -> None:
                 # P1 Refactor: Use helper function for trace display
                 display_react_trace(trace)
                 console.print(f"[dim]ReAct: {len(trace.steps)} steps, success={trace.success}[/dim]")
+                # REMOVED: Forced chatlog tool check - Agent decides autonomously
                 
             except Exception as e:
                 console.print(f"[{COLORS['error']}]ReAct error: {e}[/{COLORS['error']}]")
@@ -1701,13 +1618,15 @@ async def main() -> None:
                     thinking_budget=thinking_budget
                 )
         else:
+            # Agent-autonomous query execution
             await run_query(
-                client, 
-                text, 
+                client,
+                text,
                 session_id=resume_session_id, 
                 show_thinking=show_thinking,
-                thinking_budget=thinking_budget
+                thinking_budget=thinking_budget,
             )
+            # REMOVED: Forced retry mechanism - trust Agent's decisions
         
         # Async memory extraction after conversation
         # Use GPT-5-nano via Poe API for cost-effective extraction
@@ -1730,7 +1649,17 @@ async def main() -> None:
             await client.disconnect()
         except Exception:
             pass
-    
+    try:
+        await close_chatlog_clients()
+    except Exception:
+        pass
+    try:
+        extractor = get_memory_extractor()
+        if extractor.poe:
+            await extractor.poe.close()
+    except Exception:
+        pass
+
     # Save context state on exit
     try:
         context_manager.save_to_file(str(CONTEXT_PATH))

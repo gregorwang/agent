@@ -168,68 +168,6 @@ Output format:
         model="haiku"  # Fast for test running
     ),
 
-    # Chatlog Searcher - Evidence collection
-    "chatlog-searcher": AgentDefinition(
-        description=(
-            "Chatlog evidence collector. Use to query chat logs for supporting "
-            "evidence related to a specific question."
-        ),
-        prompt="""You are a chatlog evidence collector.
-
-Task:
-- Call mcp__chatlog__query_chatlog EXACTLY ONCE (not multiple times).
-- The user question is provided between <QUESTION> and </QUESTION>.
-- Pass the EXACT user question as the "question" parameter, DO NOT rewrite or expand it.
-- If a target person is mentioned, pass it as "target_person" parameter.
-- Extract only the directly supporting chat lines as quotes:
-  > [时间] 发送者: 内容
-- Do not add analysis, only the quoted evidence lines.
-
-【重要】实体归因规则：
-- 仔细检查每条证据是否真正描述目标人物
-- 如果消息讨论的是其他人（如"高峰"的工资不是"冯天奇"的），标记为 [非目标人物]
-- 只引用明确描述目标人物本人的对话
-""",
-        tools=["mcp__chatlog__query_chatlog"],
-        model="sonnet"
-    ),
-
-    # Chatlog Refuter - Counter-evidence collection
-    "chatlog-refuter": AgentDefinition(
-        description=(
-            "Chatlog counter-evidence collector. Use to find evidence that "
-            "contradicts or weakens the initial conclusion."
-        ),
-        prompt="""You are a chatlog counter-evidence collector.
-
-Task:
-- Call mcp__chatlog__query_chatlog exactly once.
-- The user question is provided between <QUESTION> and </QUESTION>.
-- Use the exact text between those tags as the tool input (no rewriting).
-- Extract only the counter-evidence chat lines as quotes:
-  > [时间] 发送者: 内容
-- Do not add analysis, only the quoted counter-evidence lines.
-""",
-        tools=["mcp__chatlog__query_chatlog"],
-        model="sonnet"
-    ),
-
-    # Chatlog Synthesizer - Final reasoning
-    "chatlog-synthesizer": AgentDefinition(
-        description=(
-            "Synthesizes evidence and counter-evidence into a final answer."
-        ),
-        prompt="""You are a synthesis agent.
-
-Task:
-- Combine evidence from the searcher and refuter outputs.
-- Identify contradictions or gaps.
-- Provide a balanced final answer with cited quotes.
-- If evidence is missing, say so explicitly and avoid overconfident claims.
-""",
-        tools=[],
-        model="sonnet"
-    ),
 }
 
 
