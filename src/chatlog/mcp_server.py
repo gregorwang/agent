@@ -17,6 +17,7 @@ from .loader import ChatlogLoader, get_chatlog_loader
 from .searcher import ChatlogSearcher, SearchResult
 from .cleaner import ChatlogCleaner, CleanerConfig
 from .metadata_index_loader import MetadataIndexLoader, get_index_loader
+from .semantic_index import get_semantic_index
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -30,8 +31,8 @@ _chatlog_cleaner: Optional[ChatlogCleaner] = None
 
 _CHATLOG_MAX_RETURN_CHARS = int(os.getenv("CHATLOG_MAX_RETURN_CHARS", "4000"))
 _CHATLOG_INDEX_MAX_RESULTS = int(os.getenv("CHATLOG_INDEX_MAX_RESULTS", "200"))
-_CHATLOG_INDEX_CONTEXT_BEFORE = int(os.getenv("CHATLOG_INDEX_CONTEXT_BEFORE", "4"))
-_CHATLOG_INDEX_CONTEXT_AFTER = int(os.getenv("CHATLOG_INDEX_CONTEXT_AFTER", "4"))
+_CHATLOG_INDEX_CONTEXT_BEFORE = int(os.getenv("CHATLOG_INDEX_CONTEXT_BEFORE", "2"))
+_CHATLOG_INDEX_CONTEXT_AFTER = int(os.getenv("CHATLOG_INDEX_CONTEXT_AFTER", "2"))
 
 
 def _cap_text(text: str, max_chars: int) -> str:
@@ -51,8 +52,8 @@ def _get_searcher(loader: ChatlogLoader) -> ChatlogSearcher:
     """Create a fresh ChatlogSearcher (no caching)."""
     return ChatlogSearcher(
         loader=loader,
-        context_before=int(os.getenv("CHATLOG_CONTEXT_BEFORE", "5")),
-        context_after=int(os.getenv("CHATLOG_CONTEXT_AFTER", "5"))
+        context_before=int(os.getenv("CHATLOG_CONTEXT_BEFORE", "2")),
+        context_after=int(os.getenv("CHATLOG_CONTEXT_AFTER", "2"))
     )
 
 
@@ -168,17 +169,33 @@ async def _query_chatlog_indexed_impl(args: dict) -> dict:
         matched_lines.update(lines[:max_results])
     
     # Only search by selected topics (keywords are used for topic selection only)
-    
-    # Filter by target person if specified
-    if target_person and matched_lines:
-        loader = _get_loader()
-        loader.load()
-        person_lines = set(loader.search_content(target_person))
-        matched_lines = matched_lines.intersection(person_lines) if person_lines else matched_lines
-    
+
+    # Semantic recall (optional, uses local embeddings cache)
+    sem_weight = float(os.getenv("CHATLOG_SEM_WEIGHT", "0.6"))
+    kw_weight = float(os.getenv("CHATLOG_KW_WEIGHT", "0.4"))
+    weight_sum = sem_weight + kw_weight if (sem_weight + kw_weight) > 0 else 1.0
+    sem_weight /= weight_sum
+    kw_weight /= weight_sum
+    sem_top_k = int(os.getenv("CHATLOG_SEM_TOP_K", "50"))
+    semantic_scores: Dict[int, float] = {}
+
+    semantic_index = get_semantic_index()
+    if semantic_index.is_available():
+        log("   ✓ 语义检索: 已启用", "SEARCH")
+        semantic_matches = semantic_index.search(question, top_k=sem_top_k)
+        for line_num, score in semantic_matches:
+            # Normalize cosine (-1..1) -> (0..1)
+            semantic_scores[line_num] = max(0.0, min(1.0, (score + 1.0) / 2.0))
+        log(
+            f"   ✓ 语义命中: {len(semantic_scores)} 条 | top_k={sem_top_k}",
+            "SEARCH"
+        )
+    else:
+        log("   ⚠️ 语义检索: 未启用 (缺少 embeddings 缓存)", "SEARCH")
+
     log(f"   ✓ 匹配消息: {len(matched_lines)} 条 ({time.time()-start:.2f}s)")
     
-    if not matched_lines:
+    if not matched_lines and not semantic_scores:
         log("⚠️ 未找到匹配消息", "RESULT")
         return {
             "content": [{
@@ -191,7 +208,20 @@ async def _query_chatlog_indexed_impl(args: dict) -> dict:
     log("📄 Step 3: 加载消息...", "LOAD")
     start = time.time()
     
-    sorted_lines = sorted(matched_lines)[:max_results]
+    combined_lines = set(matched_lines) | set(semantic_scores.keys())
+    if not combined_lines:
+        combined_lines = set(matched_lines)
+
+    def _score(line_num: int) -> float:
+        score = 0.0
+        if line_num in matched_lines:
+            score += kw_weight * 1.0
+        if line_num in semantic_scores:
+            score += sem_weight * semantic_scores[line_num]
+        return score
+
+    scored_lines = sorted(combined_lines, key=lambda ln: (_score(ln), -ln), reverse=True)
+    sorted_lines = scored_lines[:max_results]
     messages = index_loader.get_messages_by_lines(
         sorted_lines,
         context_before=_CHATLOG_INDEX_CONTEXT_BEFORE,
@@ -200,36 +230,110 @@ async def _query_chatlog_indexed_impl(args: dict) -> dict:
     
     log(f"   ✓ 加载消息: {len(messages)} 条 ({time.time()-start:.2f}s)")
     
-    # Step 4: Format raw results for cleaning
+    # Step 4: Format raw results for cleaning (hit-centered windows)
     log("📦 Step 4: 格式化结果...", "FORMAT")
+
+    message_map = {msg.get("line_number"): msg for msg in messages}
+    filtered_samples: List[str] = []
+    def _window_mentions_other_person(line_num: int) -> bool:
+        if not target_person:
+            return False
+        start = max(1, line_num - _CHATLOG_INDEX_CONTEXT_BEFORE)
+        end = line_num + _CHATLOG_INDEX_CONTEXT_AFTER
+        persons = set()
+        for ln in range(start, end + 1):
+            msg = message_map.get(ln)
+            if not msg:
+                continue
+            facts = (msg.get("metadata") or {}).get("facts") or {}
+            for key in ("人物", "对象", "主体", "人"):
+                val = facts.get(key)
+                if isinstance(val, str) and val.strip():
+                    persons.add(val.strip())
+        if not persons:
+            return False
+        if target_person not in persons:
+            if len(filtered_samples) < 3:
+                filtered_samples.append(
+                    f"行{line_num} persons={', '.join(sorted(persons))}"
+                )
+            return True
+        return False
+
+    if target_person:
+        filtered_lines = [
+            ln for ln in sorted_lines if not _window_mentions_other_person(ln)
+        ]
+        if filtered_lines:
+            log(
+                f"   ✓ 命中窗口过滤(基于facts): {len(sorted_lines)} -> {len(filtered_lines)}",
+                "FORMAT"
+            )
+            if filtered_samples:
+                log(
+                    "   ✓ 过滤示例: " + " | ".join(filtered_samples),
+                    "FORMAT"
+                )
+            sorted_lines = filtered_lines
 
     result_parts = []
     result_parts.append(f"## 查询: {question}")
     result_parts.append(f"话题: {', '.join(selected_topics) if selected_topics else '无'}")
     result_parts.append(f"匹配: {len(sorted_lines)} 条 | 返回: {len(messages)} 条")
     result_parts.append(f"关键词: {', '.join(keywords[:20]) if keywords else '无'}")
-    result_parts.append("---")
 
-    for msg in messages:
-        content = msg.get("content", "")
-        ts = msg.get("timestamp", "")[:19]
-        is_match = "★" if msg.get("is_match") else " "
-        result_parts.append(f"[{ts}]{is_match} {content}")
+    for idx, line_num in enumerate(sorted_lines, 1):
+        start = max(1, line_num - _CHATLOG_INDEX_CONTEXT_BEFORE)
+        end = line_num + _CHATLOG_INDEX_CONTEXT_AFTER
+        result_parts.append(
+            f"--- 命中窗口 {idx} (行 {line_num}, ±{_CHATLOG_INDEX_CONTEXT_BEFORE}/{_CHATLOG_INDEX_CONTEXT_AFTER}) ---"
+        )
+        for ln in range(start, end + 1):
+            msg = message_map.get(ln)
+            if not msg:
+                continue
+            raw = msg.get("content", "")
+            sender = "未知"
+            body = raw
+            if ": " in raw:
+                sender, body = raw.split(": ", 1)
+            ts = msg.get("timestamp", "")[:19]
+            tag = "命中" if msg.get("is_match") else "上下文"
+            confidence = "高" if msg.get("is_match") else "中"
+            result_parts.append(
+                f"[{ts}] {sender}: {body} (行{ln} {tag} 置信度:{confidence})"
+            )
 
     raw_text = "\n".join(result_parts)
 
-    # Step 5: Second-pass selection (always run)
+    # Step 5: Second-pass selection (skip if already window-formatted)
     log("🧹 Step 5: 二次筛选清洗...", "CLEAN")
-    if poe_client and poe_client.is_configured:
-        log(f"   调用 {cleaner.config.model} 进行二次筛选...", "CLEAN")
+    if target_person:
+        raw_text, attr_stats = await cleaner.entity_attribution(
+            raw_text,
+            target_person,
+            question
+        )
+        if not attr_stats.get("skipped"):
+            log(
+                f"   ✓ 实体归因: 保留 {attr_stats.get('keep_count', 0)} 条 | "
+                f"排除 {attr_stats.get('exclude_count', 0)} 条",
+                "CLEAN"
+            )
+    if "命中窗口" in raw_text:
+        cleaned = raw_text
+        log("   跳过清洗：已包含命中窗口上下文(已做实体归因)", "CLEAN")
     else:
-        log("   使用简单截断 (Poe未配置)", "CLEAN")
-    cleaned = await cleaner.clean_results(
-        formatted_text=raw_text,
-        question=question,
-        target_person=target_person,
-        force=True
-    )
+        if poe_client and poe_client.is_configured:
+            log(f"   调用 {cleaner.config.model} 进行二次筛选...", "CLEAN")
+        else:
+            log("   使用简单截断 (Poe未配置)", "CLEAN")
+        cleaned = await cleaner.clean_results(
+            formatted_text=raw_text,
+            question=question,
+            target_person=target_person,
+            force=True
+        )
     log(f"   ✓ 清洗后: {len(cleaned)} 字符", "CLEAN")
 
     result_text = _cap_text(cleaned, _CHATLOG_MAX_RETURN_CHARS)
@@ -356,21 +460,36 @@ async def _query_chatlog_impl(args: dict) -> dict:
         log(f"   原始大小: {original_len} 字符")
         log(f"   格式化耗时: {time.time()-start:.2f}s")
         
-        # Step 4: Second-pass selection (always run)
+        # Step 4: Second-pass selection (skip if already window-formatted)
         log("🧹 Step 4: 二次筛选清洗...")
         start = time.time()
 
-        if poe_client and poe_client.is_configured:
-            log(f"   调用 {cleaner.config.model} 进行二次筛选...")
+        if target_person:
+            formatted, attr_stats = await cleaner.entity_attribution(
+                formatted,
+                target_person,
+                question
+            )
+            if not attr_stats.get("skipped"):
+                log(
+                    f"   ✓ 实体归因: 保留 {attr_stats.get('keep_count', 0)} 条 | "
+                    f"排除 {attr_stats.get('exclude_count', 0)} 条"
+                )
+        if "命中窗口" in formatted:
+            cleaned = formatted
+            log("   跳过清洗：已包含命中窗口上下文(已做实体归因)")
         else:
-            log("   使用简单截断 (Poe未配置)")
+            if poe_client and poe_client.is_configured:
+                log(f"   调用 {cleaner.config.model} 进行二次筛选...")
+            else:
+                log("   使用简单截断 (Poe未配置)")
 
-        cleaned = await cleaner.clean_results(
-            formatted_text=formatted,
-            question=question,
-            target_person=target_person,
-            force=True
-        )
+            cleaned = await cleaner.clean_results(
+                formatted_text=formatted,
+                question=question,
+                target_person=target_person,
+                force=True
+            )
         log(f"   ✓ 清洗后: {len(cleaned)} 字符 ({time.time()-start:.2f}s)")
 
         

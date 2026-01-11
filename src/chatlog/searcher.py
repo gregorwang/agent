@@ -19,6 +19,7 @@ class SearchResult:
     messages: List[ChatMessage] = field(default_factory=list)
     matched_keywords: Set[str] = field(default_factory=set)
     total_chars: int = 0
+    matched_line_keywords: Dict[int, Set[str]] = field(default_factory=dict)
     
     def format_output(self, include_line_numbers: bool = False) -> str:
         """
@@ -180,7 +181,8 @@ class ChatlogSearcher:
         return SearchResult(
             messages=messages,
             matched_keywords=all_keywords,
-            total_chars=total_chars
+            total_chars=total_chars,
+            matched_line_keywords=matched_lines
         )
 
     def search_by_metadata(
@@ -290,7 +292,8 @@ class ChatlogSearcher:
         return SearchResult(
             messages=messages,
             matched_keywords=all_keywords,
-            total_chars=total_chars
+            total_chars=total_chars,
+            matched_line_keywords=matched_lines
         )
     
     def search_person_context(
@@ -349,7 +352,8 @@ class ChatlogSearcher:
         return SearchResult(
             messages=messages,
             matched_keywords=keyword_result.matched_keywords | {f"person:{person}"},
-            total_chars=total_chars
+            total_chars=total_chars,
+            matched_line_keywords=keyword_result.matched_line_keywords
         )
     
     def get_conversation_segments(
@@ -407,17 +411,54 @@ class ChatlogSearcher:
         Returns:
             Formatted string with segment separators
         """
+        if result.matched_line_keywords:
+            return self.format_context_windows(result)
+
         segments = self.get_conversation_segments(result, gap_threshold)
-        
+
         if not segments:
             return "未找到相关聊天记录。"
-        
+
         output_parts = []
         for i, segment in enumerate(segments):
             if i > 0:
                 output_parts.append("\n--- 对话片段分隔 ---\n")
-            
+
             for msg in segment:
                 output_parts.append(msg.format_simple())
-        
+
+        return "\n".join(output_parts)
+
+    def format_context_windows(
+        self,
+        result: SearchResult,
+        max_windows: int = 50
+    ) -> str:
+        """Format output as hit-centered context windows."""
+        if not result.matched_line_keywords:
+            return "未找到相关聊天记录。"
+
+        matched_lines = sorted(result.matched_line_keywords.keys())
+        output_parts: List[str] = []
+
+        for idx, line_num in enumerate(matched_lines[:max_windows], 1):
+            start = max(1, line_num - self.context_before)
+            end = line_num + self.context_after
+
+            output_parts.append(
+                f"--- 命中窗口 {idx} (行 {line_num}, ±{self.context_before}/{self.context_after}) ---"
+            )
+
+            for ln in range(start, end + 1):
+                msg = self.loader.get_message(ln)
+                if not msg:
+                    continue
+                sender = msg.sender or "未知"
+                content = msg.message or msg.content
+                tag = "命中" if ln == line_num else "上下文"
+                confidence = "高" if ln == line_num else "中"
+                output_parts.append(
+                    f"[{msg.timestamp}] {sender}: {content} (行{msg.line_number} {tag} 置信度:{confidence})"
+                )
+
         return "\n".join(output_parts)

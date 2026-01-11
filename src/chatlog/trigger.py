@@ -12,5 +12,8 @@ def should_use_chatlog_chain(text: str) -> bool:
         "根据聊天记录",
         "聊天记录里",
         "聊天记录中",
+        "调用聊天记录",
+        "调用一下聊天记录",
+        "聊天记录",
     ]
     return any(phrase in normalized for phrase in explicit_phrases)

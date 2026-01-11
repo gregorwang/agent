@@ -9,6 +9,7 @@ Uses Poe API with Gemini-2.5-Flash-Lite for:
 import os
 import json
 import asyncio
+import re
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 
@@ -647,6 +648,7 @@ class ChatlogCleaner:
 5. 保持对话上下文连贯（不要单独抽取一句话）
 6. 用 "---" 分隔不同时间段的对话片段
 7. 输出控制在{self.config.target_chars}字以内
+7.1 如果存在“命中窗口”标题，必须保留该窗口内的所有行，不要删减上下文
 
 【实体识别规则 - 非常重要】：
 8. 如果指定了目标人物，必须判断每条消息讨论的是谁
