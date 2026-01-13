@@ -337,6 +337,57 @@ async def format_messages(args: dict) -> dict:
     # ...
 ```
 
+```python
+@tool(
+    "parse_task",
+    "解析问题为任务类型与检索意图。",
+    {
+        "question": str,       # 原始问题
+        "target_person": str,  # 目标人物（可选）
+        "use_llm": bool        # 是否使用 LLM 扩展
+    }
+)
+async def parse_task(args: dict) -> dict:
+    # ...
+```
+
+```python
+@tool(
+    "retrieve_evidence",
+    "按任务意图检索多维度证据。",
+    {
+        "question": str,          # 原始问题
+        "target_person": str,     # 目标人物（可选）
+        "keywords": list,         # 关键词列表（可选）
+        "topics": list,           # 话题列表（可选）
+        "max_results": int,       # 最大结果数
+        "context_before": int,    # 上文消息数
+        "context_after": int,     # 下文消息数
+        "include_metadata": bool, # 是否包含元数据
+        "use_semantic": bool,     # 是否启用语义检索
+        "use_llm_filter": bool,   # 是否启用人物归因
+        "use_llm_expand": bool    # 是否启用查询扩展
+    }
+)
+async def retrieve_evidence(args: dict) -> dict:
+    # ...
+```
+
+```python
+@tool(
+    "analyze_evidence",
+    "基于证据列表输出模式与信号（不做决策）。",
+    {
+        "messages": list,       # 消息列表
+        "question": str,        # 原始问题（可选）
+        "target_person": str,   # 目标人物（可选）
+        "max_examples": int     # 示例数量
+    }
+)
+async def analyze_evidence(args: dict) -> dict:
+    # ...
+```
+
 ---
 
 ## 4. MCP Server 创建与工具注册
@@ -720,6 +771,9 @@ async def recall_memory(args: dict) -> dict:
 | **chatlog** | `search_semantic` | query, top_k | 语义搜索 |
 | **chatlog** | `filter_by_person` | messages, target_person, use_llm | 人物过滤 |
 | **chatlog** | `format_messages` | messages, format, max_chars | 格式化消息 |
+| **chatlog** | `parse_task` | question, target_person, use_llm | 任务解析 |
+| **chatlog** | `retrieve_evidence` | question, target_person, keywords, topics, max_results, context_before, context_after, include_metadata, use_semantic, use_llm_filter, use_llm_expand | 证据检索 |
+| **chatlog** | `analyze_evidence` | messages, question, target_person, max_examples | 证据分析 |
 
 ---
 

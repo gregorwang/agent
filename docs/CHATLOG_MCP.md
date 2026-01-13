@@ -1,8 +1,9 @@
 ﻿# Chatlog MCP Assessment and Decomposition Proposal
 
 ## Summary
-The chatlog MCP server now exposes atomic tools only (no `query_chatlog`).
-This keeps agent autonomy and makes each decision explicit.
+The chatlog MCP server exposes atomic tools and a small set of task-level tools.
+This keeps agent autonomy while providing a simpler default path for task-style
+questions.
 
 Current tools:
 - get_chatlog_stats
@@ -15,6 +16,10 @@ Current tools:
 - search_semantic
 - filter_by_person
 - format_messages
+Task-level tools (recommended for task-style questions):
+- parse_task
+- retrieve_evidence
+- analyze_evidence
 
 ## MCP Compliance Notes
 - MCP server is compliant (SDK tools + content responses).
@@ -22,6 +27,9 @@ Current tools:
 - LLM usage is optional and surfaced via tool outputs.
 
 ## Suggested Agent Flows
+Task-style question (general):
+- parse_task -> retrieve_evidence -> analyze_evidence
+
 Simple direct lookup (no cleaning):
 - expand_query -> search_by_topics -> load_messages -> format_messages
 

@@ -10,6 +10,22 @@ from claude_agent_sdk import AgentDefinition
 
 # Default agent definitions for common tasks
 AGENT_DEFINITIONS: dict[str, AgentDefinition] = {
+    # General-purpose Agent - default subagent behavior
+    "general-purpose": AgentDefinition(
+        description=(
+            "General-purpose assistant for delegated tasks. Use when no "
+            "specialized agent matches."
+        ),
+        prompt="""You are a general-purpose assistant for delegated tasks.
+
+Rules:
+- Do NOT read re.md unless the user explicitly requests it in this task.
+- Do NOT enter planning mode; execute the requested task directly.
+- Use available tools only when needed to answer the task.
+- Keep responses concise and focused on the task.""",
+        tools=None,
+        model="inherit"
+    ),
     # Explorer Agent - Fast codebase exploration
     "explorer": AgentDefinition(
         description=(

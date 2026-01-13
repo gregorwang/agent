@@ -16,6 +16,7 @@ from .mcp_server import (
     get_chatlog_stats_sync,
     close_chatlog_clients,
     compose_chatlog_query_sync,
+    compose_chatlog_analysis_sync,
 )
 
 __all__ = [
@@ -29,5 +30,6 @@ __all__ = [
     "get_chatlog_stats_sync",
     "close_chatlog_clients",
     "compose_chatlog_query_sync",
+    "compose_chatlog_analysis_sync",
 ]
 

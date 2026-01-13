@@ -249,7 +249,7 @@ Memories are stored in: `~/.benedictjun/memories.json`
 
 ## Chatlog Retrieval System
 
-Intelligent chatlog retrieval with agent-composed, atomic tools.
+Intelligent chatlog retrieval with a task reasoning path and atomic tools.
 
 ### How It Works
 
@@ -272,6 +272,12 @@ Intelligent chatlog retrieval with agent-composed, atomic tools.
 | `mcp__chatlog__search_semantic` | Semantic search by embeddings |
 | `mcp__chatlog__filter_by_person` | Filter messages by target person |
 | `mcp__chatlog__format_messages` | Format messages for display |
+| `mcp__chatlog__parse_task` | Parse task intent and generate sub-questions |
+| `mcp__chatlog__retrieve_evidence` | Retrieve structured evidence from multiple paths |
+| `mcp__chatlog__analyze_evidence` | Analyze evidence into signals and framework |
+
+Recommended task reasoning flow:
+- `mcp__chatlog__parse_task` -> `mcp__chatlog__retrieve_evidence` -> `mcp__chatlog__analyze_evidence`
 
 ### Chatlog Commands
 

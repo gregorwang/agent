@@ -8,8 +8,10 @@ Provides MCP tools for intelligent chatlog retrieval:
 """
 
 import os
+import re
 import json
 import time
+import uuid
 import asyncio
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -31,10 +33,25 @@ _chatlog_loader: Optional[ChatlogLoader] = None
 _chatlog_searcher: Optional[ChatlogSearcher] = None
 _chatlog_cleaner: Optional[ChatlogCleaner] = None
 
-_CHATLOG_MAX_RETURN_CHARS = int(os.getenv("CHATLOG_MAX_RETURN_CHARS", "4000"))
+_CHATLOG_MAX_RETURN_CHARS = int(os.getenv("CHATLOG_MAX_RETURN_CHARS", "6000"))  # 提升：有压缩可以返回更多
 _CHATLOG_INDEX_MAX_RESULTS = int(os.getenv("CHATLOG_INDEX_MAX_RESULTS", "200"))
 _CHATLOG_INDEX_CONTEXT_BEFORE = int(os.getenv("CHATLOG_INDEX_CONTEXT_BEFORE", "2"))
 _CHATLOG_INDEX_CONTEXT_AFTER = int(os.getenv("CHATLOG_INDEX_CONTEXT_AFTER", "2"))
+_CHATLOG_MAX_MESSAGES = int(os.getenv("CHATLOG_MAX_MESSAGES", "200"))
+_CHATLOG_MAX_CONTENT_CHARS = int(os.getenv("CHATLOG_MAX_CONTENT_CHARS", "500"))
+_CHATLOG_MAX_TOOL_CHARS = int(os.getenv("CHATLOG_MAX_TOOL_CHARS", "15000"))  # 提升：工具返回上限
+_CHATLOG_MAX_LIST_ITEMS = int(os.getenv("CHATLOG_MAX_LIST_ITEMS", "80"))  # 提升：列表项上限
+_CHATLOG_MAX_EVIDENCE_MESSAGES = int(os.getenv("CHATLOG_MAX_EVIDENCE_MESSAGES", "80"))  # 提升：40→80
+_CHATLOG_MAX_EVIDENCE_PER_DIM = int(os.getenv("CHATLOG_MAX_EVIDENCE_PER_DIM", "25"))  # 提升：10→25
+_CHATLOG_EVIDENCE_SNIPPET_CHARS = int(os.getenv("CHATLOG_EVIDENCE_SNIPPET_CHARS", "150"))  # 稍微放宽
+_CHATLOG_EVIDENCE_CACHE_SIZE = int(os.getenv("CHATLOG_EVIDENCE_CACHE_SIZE", "20"))
+_CHATLOG_LOAD_CONTEXT_BEFORE = int(os.getenv("CHATLOG_LOAD_CONTEXT_BEFORE", "2"))  # 提升：上下文
+_CHATLOG_LOAD_CONTEXT_AFTER = int(os.getenv("CHATLOG_LOAD_CONTEXT_AFTER", "2"))  # 提升：上下文
+_CHATLOG_LOAD_MAX_MESSAGES = int(os.getenv("CHATLOG_LOAD_MAX_MESSAGES", "60"))  # 提升：20→60
+_CHATLOG_SNIPPET_CHARS = int(os.getenv("CHATLOG_SNIPPET_CHARS", "150"))  # 稍微放宽
+
+_EVIDENCE_STORE: Dict[str, Dict[str, Any]] = {}
+_EVIDENCE_STORE_ORDER: List[str] = []
 
 
 def _cap_text(text: str, max_chars: int) -> str:
@@ -43,31 +60,159 @@ def _cap_text(text: str, max_chars: int) -> str:
         return text
     return text[:max_chars] + "\n...(已截断)"
 
+def _approx_tokens(chars: int) -> int:
+    if chars <= 0:
+        return 0
+    return max(1, int(chars / 3.6))
+
+def _log_tool_payload(tool_name: str, payload: Dict[str, Any], chars: int) -> None:
+    """Log tool result with token estimation and alert for large payloads."""
+    approx_tokens = _approx_tokens(chars)
+    threshold_chars = int(os.getenv("CHATLOG_TOOL_ALERT_CHARS", "12000"))
+    
+    # Extract field sizes
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    key_sizes: Dict[str, int] = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                key_sizes[k] = len(json.dumps(v, ensure_ascii=False))
+            except (TypeError, ValueError):
+                key_sizes[k] = 0
+    
+    largest_key = max(key_sizes.items(), key=lambda x: x[1], default=("", 0))
+    
+    if chars > threshold_chars:
+        print(f"[TOOL ALERT] ⚠️ {tool_name}: {chars} chars (~{approx_tokens} tokens) OVER THRESHOLD")
+        if largest_key[0]:
+            print(f"  └─ Largest field: '{largest_key[0]}' = {largest_key[1]} chars")
+        print(f"  └─ Fields: {list(key_sizes.keys())}")
+    else:
+        print(f"[TOOL] {tool_name}: {chars} chars (~{approx_tokens} tokens)")
+
+def _truncate_list(items: List[Any], limit: int, cursor_prefix: str) -> Tuple[List[Any], int, Optional[str]]:
+    if limit <= 0:
+        return [], len(items), f"{cursor_prefix}#offset=0"
+    if len(items) <= limit:
+        return items, 0, None
+    omitted = len(items) - limit
+    next_cursor = f"{cursor_prefix}#offset={limit}"
+    return items[:limit], omitted, next_cursor
+
+def _build_snippet(text: str, max_chars: int) -> str:
+    if not isinstance(text, str):
+        return ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
+
+# Slim data limits for preventing token explosion
+_SLIM_MAX_LIST = int(os.getenv("CHATLOG_SLIM_MAX_LIST", "50"))
+_SLIM_MAX_SNIPPET = int(os.getenv("CHATLOG_SLIM_MAX_SNIPPET", "200"))
+
+def _slim_data(data: Dict[str, Any], depth: int = 0) -> Dict[str, Any]:
+    """
+    Recursively slim down data structure to prevent token explosion.
+    
+    - Lists: truncated to _SLIM_MAX_LIST items with omitted_count
+    - Long strings: truncated to _SLIM_MAX_SNIPPET chars
+    - Nested dicts: recursively processed
+    """
+    if depth > 5:  # Prevent infinite recursion
+        return data
+    
+    slimmed: Dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, list):
+            limited, omitted, cursor = _truncate_list(
+                value, _SLIM_MAX_LIST, f"field:{key}"
+            )
+            # Slim each item if it's a dict
+            slimmed_list = []
+            for item in limited:
+                if isinstance(item, dict):
+                    slimmed_list.append(_slim_data(item, depth + 1))
+                elif isinstance(item, str) and len(item) > _SLIM_MAX_SNIPPET:
+                    slimmed_list.append(_build_snippet(item, _SLIM_MAX_SNIPPET))
+                else:
+                    slimmed_list.append(item)
+            slimmed[key] = slimmed_list
+            if omitted > 0:
+                slimmed[f"_{key}_omitted"] = omitted
+                slimmed[f"_{key}_cursor"] = cursor
+        elif isinstance(value, str) and len(value) > _SLIM_MAX_SNIPPET:
+            slimmed[key] = _build_snippet(value, _SLIM_MAX_SNIPPET)
+        elif isinstance(value, dict):
+            slimmed[key] = _slim_data(value, depth + 1)
+        else:
+            slimmed[key] = value
+    return slimmed
+
+
+def _store_evidence(payload: Dict[str, Any]) -> str:
+    evidence_id = f"evi_{uuid.uuid4().hex[:12]}"
+    _EVIDENCE_STORE[evidence_id] = payload
+    _EVIDENCE_STORE_ORDER.append(evidence_id)
+    if len(_EVIDENCE_STORE_ORDER) > _CHATLOG_EVIDENCE_CACHE_SIZE:
+        expired = _EVIDENCE_STORE_ORDER.pop(0)
+        _EVIDENCE_STORE.pop(expired, None)
+    return evidence_id
+
+def _get_evidence(evidence_id: str) -> Optional[Dict[str, Any]]:
+    if not evidence_id:
+        return None
+    return _EVIDENCE_STORE.get(evidence_id)
+
 def _build_response(
     ok: bool,
     data: Dict[str, Any],
     meta: Optional[Dict[str, Any]] = None,
-    is_error: bool = False
+    is_error: bool = False,
+    tool_name: str = "unknown",
+    slim: bool = True,
 ) -> Dict[str, Any]:
+    """Build standardized tool response with automatic data slimming."""
+    meta = meta or {}
+    meta.setdefault("tool", tool_name)
+    
+    # Apply data slimming before serialization to prevent token explosion
+    if slim and isinstance(data, dict):
+        data = _slim_data(data)
+    
     payload = {
         "ok": ok,
         "data": data,
-        "meta": meta or {}
+        "meta": meta
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)
+    _log_tool_payload(tool_name, payload, len(text))
+    if len(text) > _CHATLOG_MAX_TOOL_CHARS:
+        meta["truncated"] = True
+        meta["max_chars"] = _CHATLOG_MAX_TOOL_CHARS
+        payload["meta"] = meta
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        text = _cap_text(text, _CHATLOG_MAX_TOOL_CHARS)
     return {
         "content": [{"type": "text", "text": text}],
         **({"is_error": True} if is_error else {})
     }
 
 
-def _success(data: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return _build_response(True, data, meta=meta, is_error=False)
+def _success(
+    data: Dict[str, Any],
+    meta: Optional[Dict[str, Any]] = None,
+    tool_name: str = "unknown"
+) -> Dict[str, Any]:
+    return _build_response(True, data, meta=meta, is_error=False, tool_name=tool_name)
 
 
-def _error(message: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _error(
+    message: str,
+    meta: Optional[Dict[str, Any]] = None,
+    tool_name: str = "unknown"
+) -> Dict[str, Any]:
     payload = {"error": message}
-    return _build_response(False, payload, meta=meta, is_error=True)
+    return _build_response(False, payload, meta=meta, is_error=True, tool_name=tool_name)
 
 
 def _parse_sender_content(content: str) -> Tuple[str, str]:
@@ -75,6 +220,121 @@ def _parse_sender_content(content: str) -> Tuple[str, str]:
         sender, body = content.split(": ", 1)
         return sender, body
     return "", content
+
+
+def _extract_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract structured payload from a tool result."""
+    if not result or "content" not in result or not result["content"]:
+        return {}
+    text = result["content"][0].get("text", "")
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {"data": payload}
+
+
+def _coerce_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items: List[str] = []
+        for item in value:
+            if isinstance(item, str) and "," in item:
+                items.extend([p.strip() for p in item.replace("，", ",").split(",") if p.strip()])
+            elif isinstance(item, str):
+                items.append(item.strip())
+            else:
+                items.append(str(item))
+        return [i for i in items if i]
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace("，", ",").split(",")]
+        return [p for p in parts if p]
+    return [str(value)]
+
+
+def _coerce_int_list(value: Any) -> List[int]:
+    raw_items = _coerce_list(value)
+    cleaned: List[int] = []
+    for item in raw_items:
+        try:
+            cleaned.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return cleaned
+
+
+def _infer_task_type(question: str) -> str:
+    """Infer a high-level task type from the question."""
+    if not question:
+        return "analysis"
+    q = question.lower()
+    decision_cues = ("该不该", "要不要", "是否应该", "能不能", "值得不", "should i", "should we")
+    compare_cues = ("对比", "比较", "哪个", "更好", "区别", "difference")
+    cause_cues = ("为什么", "原因", "导致", "因为", "why")
+    plan_cues = ("什么时候", "时间", "安排", "计划", "日程", "when")
+    summary_cues = ("总结", "概括", "回顾", "梳理", "总结一下", "summarize", "summary")
+    retrieval_cues = ("有没有", "找", "查找", "搜索", "哪里", "look up", "find")
+
+    if any(cue in q for cue in decision_cues):
+        return "decision"
+    if any(cue in q for cue in compare_cues):
+        return "comparison"
+    if any(cue in q for cue in cause_cues):
+        return "attribution"
+    if any(cue in q for cue in plan_cues):
+        return "planning"
+    if any(cue in q for cue in summary_cues):
+        return "summary"
+    if any(cue in q for cue in retrieval_cues):
+        return "retrieval"
+    return "analysis"
+
+
+def _task_sub_questions(task_type: str) -> List[str]:
+    if task_type == "decision":
+        return [
+            "相关历史事件与证据有哪些？",
+            "正向/负向信号各是什么？",
+            "关键信息缺口或不确定性是什么？",
+        ]
+    if task_type == "comparison":
+        return [
+            "对比对象的关键差异是什么？",
+            "有哪些直接证据支持差异？",
+            "需要补充哪些信息？",
+        ]
+    if task_type == "attribution":
+        return [
+            "相关事件链条是什么？",
+            "可能的原因或触发因素有哪些？",
+            "哪些证据支持或反驳？",
+        ]
+    if task_type == "planning":
+        return [
+            "历史承诺或时间点是什么？",
+            "可行的安排窗口是什么？",
+            "潜在冲突或风险是什么？",
+        ]
+    if task_type == "summary":
+        return [
+            "关键事件与人物有哪些？",
+            "主要变化或转折是什么？",
+            "需要保留的证据点有哪些？",
+        ]
+    if task_type == "retrieval":
+        return [
+            "明确的关键词/话题是什么？",
+            "是否需要人物或时间过滤？",
+            "是否需要上下文窗口？",
+        ]
+    return [
+        "关键事实与证据有哪些？",
+        "是否存在模式或趋势？",
+        "需要补充哪些信息？",
+    ]
 
 
 
@@ -211,7 +471,7 @@ async def _query_chatlog_indexed_impl(args: dict) -> dict:
     weight_sum = sem_weight + kw_weight if (sem_weight + kw_weight) > 0 else 1.0
     sem_weight /= weight_sum
     kw_weight /= weight_sum
-    sem_top_k = int(os.getenv("CHATLOG_SEM_TOP_K", "50"))
+    sem_top_k = int(os.getenv("CHATLOG_SEM_TOP_K", "100"))  # 提升：有压缩可以召回更多
     semantic_scores: Dict[int, float] = {}
 
     semantic_index = get_semantic_index()
@@ -454,7 +714,7 @@ async def _query_chatlog_composed_impl(args: dict) -> dict:
             log("   ⚠️ 语义检索未启用 (缺少 embeddings 缓存)", "SEARCH")
             return {}
         log("   ✓ 语义检索启用", "SEARCH")
-        sem_top_k = int(os.getenv("CHATLOG_SEM_TOP_K", "50"))
+        sem_top_k = int(os.getenv("CHATLOG_SEM_TOP_K", "100"))  # 提升：有压缩可以召回更多
         semantic_matches = await asyncio.to_thread(
             semantic_index.search,
             question,
@@ -765,35 +1025,27 @@ async def _get_chatlog_stats_impl(args: dict) -> dict:
     
     if not loader.is_loaded:
         if not loader.load():
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": f"错误：无法加载聊天记录文件 {loader.file_path}"
-                }]
-            }
+            return _error(
+                f"错误：无法加载聊天记录文件 {loader.file_path}",
+                meta={"source": "stats"},
+                tool_name="get_chatlog_stats"
+            )
     
     stats = loader.get_stats()
-    
-    output = "## 聊天记录统计\n\n"
-    output += f"**文件路径**: {stats['file_path']}\n"
-    output += f"**总消息数**: {stats['total_messages']}\n"
-    output += f"\n### 发送者统计\n\n"
-    
-    for sender, count in stats['sender_message_counts'].items():
-        output += f"- **{sender}**: {count} 条消息\n"
-    
-    output = _cap_text(output, _CHATLOG_MAX_RETURN_CHARS)
-    return {
-        "content": [{
-            "type": "text",
-            "text": output
-        }]
+
+    data = {
+        "stats": stats,
     }
+    meta = {
+        "available": True,
+        "source": "stats",
+    }
+    return _success(data, meta=meta, tool_name="get_chatlog_stats")
 
 
 async def _list_topics_impl(args: dict) -> dict:
     started = time.time()
-    limit = int(args.get("limit", 100))
+    limit = min(int(args.get("limit", _CHATLOG_MAX_LIST_ITEMS)), _CHATLOG_MAX_LIST_ITEMS)
     pattern = (args.get("pattern") or "").strip()
 
     index_loader = get_index_loader()
@@ -804,7 +1056,8 @@ async def _list_topics_impl(args: dict) -> dict:
                 "available": False,
                 "source": "index",
                 "timing_ms": int((time.time() - started) * 1000)
-            }
+            },
+            tool_name="list_topics"
         )
 
     topics = index_loader.available_topics
@@ -813,10 +1066,17 @@ async def _list_topics_impl(args: dict) -> dict:
         topics = [t for t in topics if pattern_lower in t.lower()]
 
     topics_sorted = sorted(topics)
+    limited, omitted_count, next_cursor = _truncate_list(
+        topics_sorted,
+        limit,
+        cursor_prefix=f"topics:{pattern or 'all'}"
+    )
     data = {
-        "topics": topics_sorted[:limit],
+        "topics": limited,
         "total_count": len(index_loader.available_topics),
-        "returned_count": min(len(topics_sorted), limit),
+        "returned_count": len(limited),
+        "omitted_count": omitted_count,
+        "next_cursor": next_cursor,
         "pattern": pattern or None,
     }
     meta = {
@@ -824,16 +1084,20 @@ async def _list_topics_impl(args: dict) -> dict:
         "source": "index",
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="list_topics")
 
 
 async def _search_by_topics_impl(args: dict) -> dict:
     started = time.time()
-    topics = args.get("topics") or []
-    max_results = min(int(args.get("max_results", 100)), 500)
+    topics = _coerce_list(args.get("topics"))
+    max_results = min(int(args.get("max_results", _CHATLOG_MAX_LIST_ITEMS)), 500)
 
     if not topics:
-        return _error("请提供至少一个话题", meta={"source": "index"})
+        return _error(
+            "请提供至少一个话题",
+            meta={"source": "index"},
+            tool_name="search_by_topics"
+        )
 
     index_loader = get_index_loader()
     if not index_loader.load_index():
@@ -843,7 +1107,8 @@ async def _search_by_topics_impl(args: dict) -> dict:
                 "available": False,
                 "source": "index",
                 "timing_ms": int((time.time() - started) * 1000)
-            }
+            },
+            tool_name="search_by_topics"
         )
 
     all_lines: set[int] = set()
@@ -853,29 +1118,40 @@ async def _search_by_topics_impl(args: dict) -> dict:
         breakdown[topic] = len(lines)
         all_lines.update(lines)
 
-    line_numbers = sorted(all_lines)[:max_results]
+    line_numbers = sorted(all_lines)
+    limited, omitted_count, next_cursor = _truncate_list(
+        line_numbers,
+        max_results,
+        cursor_prefix="topics"
+    )
     data = {
-        "line_numbers": line_numbers,
+        "line_numbers": limited,
         "total_matches": len(all_lines),
         "topic_breakdown": breakdown,
+        "omitted_count": omitted_count,
+        "next_cursor": next_cursor,
     }
     meta = {
         "available": True,
         "source": "index",
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="search_by_topics")
 
 
 async def _search_by_keywords_impl(args: dict) -> dict:
     started = time.time()
-    keywords = args.get("keywords") or []
+    keywords = _coerce_list(args.get("keywords"))
     target_person = args.get("target_person")
-    max_results = min(int(args.get("max_results", 100)), 500)
+    max_results = min(int(args.get("max_results", _CHATLOG_MAX_LIST_ITEMS)), 500)
     match_all = bool(args.get("match_all", False))
 
     if not keywords:
-        return _error("请提供至少一个关键词", meta={"source": "scan"})
+        return _error(
+            "请提供至少一个关键词",
+            meta={"source": "scan"},
+            tool_name="search_by_keywords"
+        )
 
     loader = _get_loader()
     if not loader.load():
@@ -885,7 +1161,8 @@ async def _search_by_keywords_impl(args: dict) -> dict:
                 "available": False,
                 "source": "scan",
                 "timing_ms": int((time.time() - started) * 1000)
-            }
+            },
+            tool_name="search_by_keywords"
         )
 
     normalized_keywords = [k.lower() for k in keywords if isinstance(k, str)]
@@ -904,39 +1181,70 @@ async def _search_by_keywords_impl(args: dict) -> dict:
             for kw in matches:
                 keyword_hits[kw] += 1
 
+    limited, omitted_count, next_cursor = _truncate_list(
+        matched_lines,
+        max_results,
+        cursor_prefix="keywords"
+    )
     data = {
-        "line_numbers": matched_lines[:max_results],
+        "line_numbers": limited,
         "total_matches": len(matched_lines),
         "keyword_breakdown": keyword_hits,
         "person_filter": target_person,
         "match_all": match_all,
+        "omitted_count": omitted_count,
+        "next_cursor": next_cursor,
     }
     meta = {
         "available": True,
         "source": "scan",
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="search_by_keywords")
 
 
 async def _load_messages_impl(args: dict) -> dict:
     started = time.time()
-    line_numbers = args.get("line_numbers") or []
-    context_before = min(int(args.get("context_before", 0)), 10)
-    context_after = min(int(args.get("context_after", 0)), 10)
+    line_numbers = _coerce_int_list(args.get("line_numbers"))
+    context_before = min(
+        int(args.get("context_before", _CHATLOG_LOAD_CONTEXT_BEFORE)),
+        5,
+    )
+    context_after = min(
+        int(args.get("context_after", _CHATLOG_LOAD_CONTEXT_AFTER)),
+        5,
+    )
     include_metadata = bool(args.get("include_metadata", False))
+    max_messages = min(
+        int(args.get("max_messages", _CHATLOG_LOAD_MAX_MESSAGES)),
+        200,
+    )
+    max_content_chars = min(
+        int(args.get("max_content_chars", _CHATLOG_MAX_CONTENT_CHARS)),
+        2000
+    )
+    snippet_chars = min(
+        int(args.get("snippet_chars", _CHATLOG_SNIPPET_CHARS)),
+        500,
+    )
+    fields = args.get("fields") or ["line", "time", "sender", "content"]
 
     if not line_numbers:
-        return _error("请提供行号列表", meta={"source": "index"})
+        return _error(
+            "请提供行号列表",
+            meta={"source": "index"},
+            tool_name="load_messages"
+        )
 
-    cleaned_lines = []
-    for ln in line_numbers[:200]:
-        try:
-            cleaned_lines.append(int(ln))
-        except (TypeError, ValueError):
-            continue
+    context_span = max(1, context_before + context_after + 1)
+    max_lines = max(1, int(max_messages / context_span))
+    cleaned_lines = line_numbers[:max_lines]
     if not cleaned_lines:
-        return _error("行号格式无效", meta={"source": "index"})
+        return _error(
+            "行号格式无效",
+            meta={"source": "index"},
+            tool_name="load_messages"
+        )
 
     index_loader = get_index_loader()
     if not index_loader.load_index():
@@ -946,7 +1254,8 @@ async def _load_messages_impl(args: dict) -> dict:
                 "available": False,
                 "source": "index",
                 "timing_ms": int((time.time() - started) * 1000)
-            }
+            },
+            tool_name="load_messages"
         )
 
     messages = index_loader.get_messages_by_lines(
@@ -954,32 +1263,54 @@ async def _load_messages_impl(args: dict) -> dict:
         context_before=context_before,
         context_after=context_after,
     )
+    limited_messages, omitted_count, next_cursor = _truncate_list(
+        messages,
+        max_messages,
+        cursor_prefix="messages"
+    )
+    truncated = omitted_count > 0
     result = []
-    for msg in messages:
+    normalized_fields = [f for f in fields if isinstance(f, str) and f.strip()]
+    if "line" not in normalized_fields:
+        normalized_fields.insert(0, "line")
+    for msg in limited_messages:
         raw = msg.get("content", "")
         sender, body = _parse_sender_content(raw)
+        if max_content_chars > 0 and len(body) > max_content_chars:
+            body = body[:max_content_chars] + "…"
+        snippet = _build_snippet(body, snippet_chars)
         item = {
             "line": msg.get("line_number"),
             "time": (msg.get("timestamp") or "")[:19],
             "sender": sender or "未知",
-            "content": body,
+            "content": snippet,
             "is_match": bool(msg.get("is_match")),
         }
         if include_metadata:
             item["metadata"] = msg.get("metadata", {})
+        if "topics" in msg:
+            item["topics"] = msg.get("topics")
+        item = {k: v for k, v in item.items() if k in normalized_fields or k == "metadata"}
         result.append(item)
 
     data = {
         "messages": result,
         "count": len(result),
         "context": f"±{context_before}/{context_after}",
+        "truncated": truncated,
+        "omitted_count": omitted_count,
+        "next_cursor": next_cursor,
+        "max_messages": max_messages,
+        "max_content_chars": max_content_chars,
+        "snippet_chars": snippet_chars,
+        "fields": normalized_fields,
     }
     meta = {
         "available": True,
         "source": "index",
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="load_messages")
 
 
 async def _expand_query_impl(args: dict) -> dict:
@@ -989,10 +1320,17 @@ async def _expand_query_impl(args: dict) -> dict:
     use_llm = bool(args.get("use_llm", True))
 
     if not question:
-        return _error("请提供问题", meta={"source": "llm"})
+        return _error(
+            "请提供问题",
+            meta={"source": "llm"},
+            tool_name="expand_query"
+        )
 
     index_loader = get_index_loader()
     available_topics = index_loader.available_topics if index_loader.load_index() else []
+    # Only pass first 50 topics as preview to LLM to prevent token explosion
+    # Full available_topics list (1771+) would consume ~8k tokens
+    topics_preview = available_topics[:50] if available_topics else []
 
     cleaner = _get_cleaner()
     poe_client = cleaner._get_poe_client()
@@ -1000,8 +1338,11 @@ async def _expand_query_impl(args: dict) -> dict:
 
     if use_llm and llm_available:
         keywords, metadata = await cleaner.expand_query(
-            question, target_person, available_topics
+            question, target_person, topics_preview  # Pass preview, not full list
         )
+        # Server-side filtering: ensure LLM-suggested topics exist in available_topics
+        llm_topics = metadata.get("topics", [])
+        metadata["topics"] = [t for t in llm_topics if t in available_topics]
         method = "llm"
         model = cleaner.config.model
         llm_used = True
@@ -1023,14 +1364,33 @@ async def _expand_query_impl(args: dict) -> dict:
         model = None
         llm_used = False
 
+    limited_keywords, kw_omitted, kw_cursor = _truncate_list(
+        keywords,
+        _CHATLOG_MAX_LIST_ITEMS,
+        cursor_prefix="keywords"
+    )
+    raw_topics = metadata.get("topics", []) or []
+    limited_topics, topic_omitted, topic_cursor = _truncate_list(
+        raw_topics,
+        _CHATLOG_MAX_LIST_ITEMS,
+        cursor_prefix="topics"
+    )
     data = {
-        "keywords": keywords,
-        "topics": metadata.get("topics", []),
+        "keywords": limited_keywords,
+        "topics": limited_topics,
         "sentiment": metadata.get("sentiment"),
         "information_density": metadata.get("information_density"),
         "method": method,
         "model": model,
         "llm_available": llm_available,
+        "omitted_count": {
+            "keywords": kw_omitted,
+            "topics": topic_omitted,
+        },
+        "next_cursor": {
+            "keywords": kw_cursor,
+            "topics": topic_cursor,
+        },
     }
     meta = {
         "available": True,
@@ -1039,16 +1399,20 @@ async def _expand_query_impl(args: dict) -> dict:
         "model": model,
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="expand_query")
 
 
 async def _search_semantic_impl(args: dict) -> dict:
     started = time.time()
     query = args.get("query", "")
-    top_k = min(int(args.get("top_k", 50)), 200)
+    top_k = min(int(args.get("top_k", _CHATLOG_MAX_LIST_ITEMS)), 200)
 
     if not query:
-        return _error("请提供查询文本", meta={"source": "semantic"})
+        return _error(
+            "请提供查询文本",
+            meta={"source": "semantic"},
+            tool_name="search_semantic"
+        )
 
     semantic_index = get_semantic_index()
     if not semantic_index.is_available():
@@ -1063,25 +1427,32 @@ async def _search_semantic_impl(args: dict) -> dict:
             "source": "semantic",
             "timing_ms": int((time.time() - started) * 1000),
         }
-        return _success(data, meta=meta)
+        return _success(data, meta=meta, tool_name="search_semantic")
 
     raw_results = semantic_index.search(query, top_k=top_k)
     results = [
         {"line": ln, "score": round((score + 1.0) / 2.0, 4)}
         for ln, score in raw_results
     ]
+    limited, omitted_count, next_cursor = _truncate_list(
+        results,
+        top_k,
+        cursor_prefix="semantic"
+    )
     data = {
         "available": True,
-        "results": results,
-        "count": len(results),
+        "results": limited,
+        "count": len(limited),
         "query": query,
+        "omitted_count": omitted_count,
+        "next_cursor": next_cursor,
     }
     meta = {
         "available": True,
         "source": "semantic",
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="search_semantic")
 
 
 async def _filter_by_person_impl(args: dict) -> dict:
@@ -1091,9 +1462,17 @@ async def _filter_by_person_impl(args: dict) -> dict:
     use_llm = bool(args.get("use_llm", True))
 
     if not messages:
-        return _error("请提供消息列表", meta={"source": "llm"})
+        return _error(
+            "请提供消息列表",
+            meta={"source": "llm"},
+            tool_name="filter_by_person"
+        )
     if not target_person:
-        return _error("请提供目标人物", meta={"source": "llm"})
+        return _error(
+            "请提供目标人物",
+            meta={"source": "llm"},
+            tool_name="filter_by_person"
+        )
 
     cleaner = _get_cleaner()
     poe_client = cleaner._get_poe_client()
@@ -1153,7 +1532,7 @@ async def _filter_by_person_impl(args: dict) -> dict:
         "target_person": target_person,
         "llm_available": llm_available,
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="filter_by_person")
 
 
 async def _format_messages_impl(args: dict) -> dict:
@@ -1163,7 +1542,11 @@ async def _format_messages_impl(args: dict) -> dict:
     max_chars = min(int(args.get("max_chars", _CHATLOG_MAX_RETURN_CHARS)), 10000)
 
     if not messages:
-        return _error("请提供消息列表", meta={"source": "format"})
+        return _error(
+            "请提供消息列表",
+            meta={"source": "format"},
+            tool_name="format_messages"
+        )
 
     lines: List[str] = []
     if fmt == "timeline":
@@ -1210,71 +1593,663 @@ async def _format_messages_impl(args: dict) -> dict:
         "source": "format",
         "timing_ms": int((time.time() - started) * 1000),
     }
-    return _success(data, meta=meta)
+    return _success(data, meta=meta, tool_name="format_messages")
+
+
+def _extract_amounts(text: str) -> List[str]:
+    if not text:
+        return []
+    amounts: List[str] = []
+    pattern = re.compile(r"(\d+(?:\.\d+)?)\s*(元|块|￥|¥|rmb|人民币)", re.IGNORECASE)
+    for match in pattern.finditer(text):
+        amount = match.group(1)
+        unit = match.group(2)
+        amounts.append(f"{amount}{unit}")
+    return amounts
+
+
+def _classify_signal(content: str) -> Tuple[bool, bool]:
+    repay_keywords = ("还", "还钱", "还款", "还你", "还我", "已还", "转账给")
+    negative_keywords = ("没还", "未还", "拖", "推迟", "下次", "改天", "晚点")
+
+    has_repay = any(k in content for k in repay_keywords)
+    has_negative = any(k in content for k in negative_keywords)
+    return has_repay, has_negative
+
+
+async def _parse_task_impl(args: dict) -> dict:
+    started = time.time()
+    question = args.get("question", "")
+    target_person = args.get("target_person")
+    use_llm = bool(args.get("use_llm", True))
+    max_dimensions = min(int(args.get("max_dimensions", 4)), 6)
+
+    if not question:
+        return _error(
+            "请提供问题",
+            meta={"source": "parse"},
+            tool_name="parse_task"
+        )
+
+    index_loader = get_index_loader()
+    available_topics = index_loader.available_topics if index_loader.load_index() else []
+    cleaner = _get_cleaner()
+    poe_client = cleaner._get_poe_client()
+    llm_available = bool(poe_client and poe_client.is_configured)
+
+    if use_llm and llm_available:
+        plan = await cleaner.plan_evidence_dimensions(
+            question,
+            target_person=target_person,
+            available_topics=available_topics,
+            max_dimensions=max_dimensions,
+        )
+        method = plan.get("method", "llm")
+        model = plan.get("model")
+    else:
+        plan = cleaner._fallback_dimension_plan(
+            question,
+            target_person=target_person,
+            available_topics=available_topics,
+            max_dimensions=max_dimensions,
+        )
+        method = plan.get("method", "rule_based")
+        model = plan.get("model")
+
+    task_type = _infer_task_type(question)
+
+    output = {
+        "task_type": task_type,
+        "question_type": plan.get("question_type", "analysis"),
+        "target_person": target_person,
+        "dimensions": plan.get("dimensions", []),
+        "method": method,
+        "model": model,
+    }
+    result_meta = {
+        "available": True,
+        "source": "parse",
+        "timing_ms": int((time.time() - started) * 1000),
+    }
+    return _success(output, meta=result_meta, tool_name="parse_task")
+
+
+async def _retrieve_evidence_impl(args: dict) -> dict:
+    started = time.time()
+    question = args.get("question", "")
+    target_person = args.get("target_person")
+    dimensions = args.get("dimensions") or []
+    max_per_dimension = min(
+        int(args.get("max_per_dimension", _CHATLOG_MAX_EVIDENCE_PER_DIM)),
+        _CHATLOG_MAX_EVIDENCE_PER_DIM,
+    )
+    max_total_messages = min(
+        int(args.get("max_total_messages", _CHATLOG_MAX_EVIDENCE_MESSAGES)),
+        _CHATLOG_MAX_EVIDENCE_MESSAGES,
+    )
+    snippet_chars = min(
+        int(args.get("snippet_chars", _CHATLOG_EVIDENCE_SNIPPET_CHARS)),
+        300,
+    )
+    context_before = min(
+        int(args.get("context_before", _CHATLOG_LOAD_CONTEXT_BEFORE)),
+        3,
+    )
+    context_after = min(
+        int(args.get("context_after", _CHATLOG_LOAD_CONTEXT_AFTER)),
+        3,
+    )
+    use_semantic = bool(args.get("use_semantic", True))
+    use_llm_plan = bool(args.get("use_llm_plan", True))
+
+    if not question and not dimensions:
+        return _error(
+            "请提供问题或维度计划",
+            meta={"source": "retrieve"},
+            tool_name="retrieve_evidence"
+        )
+
+    index_loader = get_index_loader()
+    if not index_loader.load_index():
+        return _error(
+            "无法加载索引",
+            meta={"source": "index"},
+            tool_name="retrieve_evidence"
+        )
+
+    available_topics = index_loader.available_topics
+
+    if not dimensions:
+        cleaner = _get_cleaner()
+        poe_client = cleaner._get_poe_client()
+        llm_available = bool(poe_client and poe_client.is_configured)
+        if use_llm_plan and llm_available:
+            plan = await cleaner.plan_evidence_dimensions(
+                question,
+                target_person=target_person,
+                available_topics=available_topics,
+                max_dimensions=4,
+            )
+        else:
+            plan = cleaner._fallback_dimension_plan(
+                question,
+                target_person=target_person,
+                available_topics=available_topics,
+                max_dimensions=4,
+            )
+        dimensions = plan.get("dimensions", [])
+
+    if not dimensions:
+        data = {
+            "evidence_id": None,
+            "dimensions": [],
+            "limits": {
+                "max_per_dimension": max_per_dimension,
+                "max_total_messages": max_total_messages,
+            },
+        }
+        meta = {
+            "available": True,
+            "source": "retrieve",
+            "timing_ms": int((time.time() - started) * 1000),
+        }
+        return _success(data, meta=meta, tool_name="retrieve_evidence")
+
+    semantic_index = get_semantic_index()
+    sem_weight = float(os.getenv("CHATLOG_SEM_WEIGHT", "0.6"))
+    kw_weight = float(os.getenv("CHATLOG_KW_WEIGHT", "0.4"))
+    weight_sum = sem_weight + kw_weight if (sem_weight + kw_weight) > 0 else 1.0
+    sem_weight /= weight_sum
+    kw_weight /= weight_sum
+    high_info_lines = set(index_loader.get_high_value_messages())
+
+    evidence_store: List[Dict[str, Any]] = []
+    dimension_outputs: List[Dict[str, Any]] = []
+    remaining_budget = max_total_messages
+
+    for dim in dimensions:
+        if remaining_budget <= 0:
+            break
+        name = dim.get("name") or "未命名维度"
+        intent = dim.get("intent") or ""
+        topic_seeds = _coerce_list(dim.get("topic_seeds"))
+        keyword_seeds = _coerce_list(dim.get("keyword_seeds"))
+        semantic_queries = _coerce_list(dim.get("semantic_queries"))
+        counter_queries = _coerce_list(dim.get("counter_queries"))
+        min_evidence = int(dim.get("min_evidence", 3))
+
+        topic_seeds = [t for t in topic_seeds if t in available_topics]
+        topic_lines: Dict[int, int] = {}
+        for topic in topic_seeds:
+            for ln in index_loader.search_by_topic_exact(topic):
+                topic_lines[ln] = topic_lines.get(ln, 0) + 1
+
+        semantic_lines: Dict[int, float] = {}
+        if use_semantic and semantic_queries and semantic_index.is_available():
+            sem_top_k = min(_CHATLOG_MAX_LIST_ITEMS, max_per_dimension * 4)
+            for query in semantic_queries:
+                for line_num, score in semantic_index.search(query, top_k=sem_top_k):
+                    semantic_lines[line_num] = max(
+                        semantic_lines.get(line_num, 0.0),
+                        max(0.0, min(1.0, (score + 1.0) / 2.0)),
+                    )
+
+        keyword_lines: Dict[int, int] = {}
+        if keyword_seeds and not topic_lines and not semantic_lines:
+            keyword_result = await _search_by_keywords_impl({
+                "keywords": keyword_seeds,
+                "target_person": target_person,
+                "max_results": _CHATLOG_MAX_LIST_ITEMS,
+                "match_all": False,
+            })
+            payload = _extract_payload(keyword_result)
+            keyword_data = payload.get("data", {})
+            for ln in keyword_data.get("line_numbers", []) or []:
+                if isinstance(ln, int):
+                    keyword_lines[ln] = keyword_lines.get(ln, 0) + 1
+
+        combined_lines = set(topic_lines.keys()) | set(keyword_lines.keys()) | set(semantic_lines.keys())
+        if not combined_lines:
+            dimension_outputs.append({
+                "name": name,
+                "intent": intent,
+                "evidence": [],
+                "counter_evidence": [],
+                "coverage": {
+                    "topic_seeds": topic_seeds,
+                    "keyword_seeds": keyword_seeds,
+                    "semantic_queries": semantic_queries,
+                    "counter_queries": counter_queries,
+                },
+                "omitted_count": 0,
+                "next_cursor": None,
+                "min_evidence": min_evidence,
+            })
+            continue
+
+        def _score(line_num: int) -> float:
+            score = 0.0
+            if line_num in topic_lines or line_num in keyword_lines:
+                score += kw_weight
+            if line_num in semantic_lines:
+                score += sem_weight * semantic_lines[line_num]
+            if line_num in high_info_lines:
+                score += 0.15
+            return score
+
+        ranked_lines = sorted(combined_lines, key=lambda ln: (_score(ln), -ln), reverse=True)
+        desired = min(max_per_dimension, remaining_budget)
+        selected_lines = ranked_lines[:desired]
+        omitted_count = max(0, len(combined_lines) - len(selected_lines))
+
+        messages = index_loader.get_messages_by_lines(
+            selected_lines,
+            context_before=context_before,
+            context_after=context_after,
+        )
+        formatted_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            if not msg.get("is_match"):
+                continue
+            raw = msg.get("content", "")
+            sender, body = _parse_sender_content(raw)
+            full_content = body
+            if _CHATLOG_MAX_CONTENT_CHARS > 0 and len(full_content) > _CHATLOG_MAX_CONTENT_CHARS:
+                full_content = full_content[:_CHATLOG_MAX_CONTENT_CHARS] + "…"
+            snippet = _build_snippet(full_content, snippet_chars)
+            mentions_target = False
+            if target_person:
+                mentions_target = target_person in (sender or "") or target_person in full_content
+            score = _score(msg.get("line_number", 0))
+            formatted_messages.append({
+                "line": msg.get("line_number"),
+                "time": (msg.get("timestamp") or "")[:19],
+                "sender": sender or "未知",
+                "content": full_content,
+                "snippet": snippet,
+                "topics": msg.get("topics", []),
+                "metadata": msg.get("metadata", {}),
+                "score": round(score, 4),
+                "dimension": name,
+                "mentions_target": mentions_target,
+                "is_counter": False,
+            })
+
+        formatted_messages.sort(key=lambda m: (m.get("mentions_target"), m.get("score")), reverse=True)
+        formatted_messages = formatted_messages[:desired]
+        remaining_budget -= len(formatted_messages)
+
+        counter_evidence: List[Dict[str, Any]] = []
+        counter_store: List[Dict[str, Any]] = []
+        if use_semantic and counter_queries and semantic_index.is_available():
+            counter_lines: Dict[int, float] = {}
+            counter_top_k = min(_CHATLOG_MAX_LIST_ITEMS, max(5, int(max_per_dimension / 2)))
+            for query in counter_queries:
+                for line_num, score in semantic_index.search(query, top_k=counter_top_k):
+                    counter_lines[line_num] = max(
+                        counter_lines.get(line_num, 0.0),
+                        max(0.0, min(1.0, (score + 1.0) / 2.0)),
+                    )
+            counter_candidates = [ln for ln in counter_lines.keys() if ln not in selected_lines]
+            if counter_candidates:
+                counter_messages = index_loader.get_messages_by_lines(
+                    counter_candidates[:counter_top_k],
+                    context_before=0,
+                    context_after=0,
+                )
+                for msg in counter_messages:
+                    if not msg.get("is_match"):
+                        continue
+                    raw = msg.get("content", "")
+                    sender, body = _parse_sender_content(raw)
+                    full_content = body
+                    if _CHATLOG_MAX_CONTENT_CHARS > 0 and len(full_content) > _CHATLOG_MAX_CONTENT_CHARS:
+                        full_content = full_content[:_CHATLOG_MAX_CONTENT_CHARS] + "…"
+                    snippet = _build_snippet(full_content, snippet_chars)
+                    counter_store.append({
+                        "line": msg.get("line_number"),
+                        "time": (msg.get("timestamp") or "")[:19],
+                        "sender": sender or "未知",
+                        "content": full_content,
+                        "snippet": snippet,
+                        "topics": msg.get("topics", []),
+                        "metadata": msg.get("metadata", {}),
+                        "score": round(counter_lines.get(msg.get("line_number"), 0.0), 4),
+                        "dimension": name,
+                        "mentions_target": (
+                            target_person in (sender or "") or target_person in full_content
+                        ) if target_person else False,
+                        "is_counter": True,
+                    })
+                    counter_evidence.append({
+                        "line": msg.get("line_number"),
+                        "time": (msg.get("timestamp") or "")[:19],
+                        "sender": sender or "未知",
+                        "snippet": snippet,
+                        "score": round(counter_lines.get(msg.get("line_number"), 0.0), 4),
+                        "is_counter": True,
+                    })
+            counter_evidence = counter_evidence[:max(1, int(max_per_dimension / 3))]
+
+        evidence_store.extend(formatted_messages)
+        evidence_store.extend(counter_store)
+
+        dimension_outputs.append({
+            "name": name,
+            "intent": intent,
+            "evidence": [
+                {
+                    "line": m.get("line"),
+                    "time": m.get("time"),
+                    "sender": m.get("sender"),
+                    "snippet": m.get("snippet"),
+                    "topics": m.get("topics", []),
+                    "score": m.get("score"),
+                }
+                for m in formatted_messages
+            ],
+            "counter_evidence": counter_evidence,
+            "coverage": {
+                "topic_seeds": topic_seeds,
+                "keyword_seeds": keyword_seeds,
+                "semantic_queries": semantic_queries,
+                "counter_queries": counter_queries,
+            },
+            "omitted_count": omitted_count,
+            "next_cursor": None if omitted_count == 0 else f"dimension:{name}#offset={desired}",
+            "min_evidence": min_evidence,
+        })
+
+    # Step: Optionally compress messages using Poe small model
+    use_compression = bool(args.get("use_compression", True))
+    if use_compression and evidence_store:
+        cleaner = _get_cleaner()
+        poe_client = cleaner._get_poe_client()
+        if poe_client and poe_client.is_configured:
+            try:
+                evidence_store = await cleaner.compress_messages(
+                    evidence_store,
+                    question,
+                    target_person=target_person,
+                    max_output_messages=max_total_messages,
+                    compression_ratio=0.5,
+                )
+                print(f"[RETRIEVE] ✓ 智能压缩: {len(evidence_store)} 条消息")
+            except Exception as e:
+                print(f"[RETRIEVE] 压缩失败, 使用原始数据: {e}")
+
+    evidence_id = _store_evidence({
+        "question": question,
+        "target_person": target_person,
+        "dimensions": dimensions,
+        "messages": evidence_store,
+    })
+
+    data = {
+        "evidence_id": evidence_id,
+        "dimensions": dimension_outputs,
+        "limits": {
+            "max_per_dimension": max_per_dimension,
+            "max_total_messages": max_total_messages,
+            "snippet_chars": snippet_chars,
+            "context_window": f"±{context_before}/{context_after}",
+        },
+        "inputs": {
+            "question": question,
+            "target_person": target_person,
+        },
+    }
+    meta = {
+        "available": True,
+        "source": "retrieve",
+        "timing_ms": int((time.time() - started) * 1000),
+    }
+    return _success(data, meta=meta, tool_name="retrieve_evidence")
+
+
+async def _analyze_evidence_impl(args: dict) -> dict:
+    started = time.time()
+    evidence_id = args.get("evidence_id")
+    messages = args.get("messages") or []
+    question = args.get("question", "")
+    target_person = args.get("target_person")
+    max_examples = min(int(args.get("max_examples", 3)), 5)
+    use_llm_analysis = bool(args.get("use_llm_analysis", True))  # 使用 Poe 小模型生成智能分析
+
+    stored = _get_evidence(evidence_id) if evidence_id else None
+    if stored:
+        messages = stored.get("messages", []) or []
+        question = question or stored.get("question", "")
+        target_person = target_person or stored.get("target_person")
+        dimensions = stored.get("dimensions", []) or []
+    else:
+        dimensions = args.get("dimensions") or []
+
+    if not messages:
+        return _error(
+            "请提供 evidence_id 或消息列表",
+            meta={"source": "analysis"},
+            tool_name="analyze_evidence"
+        )
+
+    if not dimensions:
+        dimensions = [{
+            "name": "综合证据",
+            "intent": "",
+            "min_evidence": 3,
+        }]
+        for msg in messages:
+            msg.setdefault("dimension", "综合证据")
+
+    matrix: List[Dict[str, Any]] = []
+    sender_counts: Dict[str, int] = {}
+    for msg in messages:
+        sender = msg.get("sender", "未知")
+        sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+    for dim in dimensions:
+        name = dim.get("name") or "未命名维度"
+        intent = dim.get("intent") or ""
+        min_evidence = int(dim.get("min_evidence", 3))
+        dim_messages = [m for m in messages if m.get("dimension") == name and not m.get("is_counter")]
+        counter_messages = [m for m in messages if m.get("dimension") == name and m.get("is_counter")]
+
+        dim_messages.sort(key=lambda m: (m.get("mentions_target"), m.get("score", 0)), reverse=True)
+        counter_messages.sort(key=lambda m: m.get("score", 0), reverse=True)
+
+        selected = dim_messages[:max_examples]
+        counter_selected = counter_messages[:max(1, int(max_examples / 2))] if counter_messages else []
+
+        topics_seen: List[str] = []
+        for msg in selected:
+            for topic in msg.get("topics", []) or []:
+                if topic not in topics_seen:
+                    topics_seen.append(topic)
+            if len(topics_seen) >= 4:
+                break
+
+        if not selected:
+            conclusion = "该维度证据不足，暂无法形成稳定结论。"
+        elif counter_selected:
+            conclusion = "该维度存在互相矛盾的信号，需要更多上下文确认倾向。"
+        else:
+            conclusion = "该维度证据相对集中，呈现出一致的倾向性。"
+
+        gaps: List[str] = []
+        if len(dim_messages) < min_evidence:
+            gaps.append("证据数量不足")
+        if target_person and not any(m.get("mentions_target") for m in dim_messages):
+            gaps.append("证据中目标人物出现较少")
+        if not counter_messages:
+            gaps.append("缺少明确反证")
+
+        if len(dim_messages) >= min_evidence + 2:
+            confidence = "high"
+        elif len(dim_messages) >= min_evidence:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        matrix.append({
+            "dimension": name,
+            "intent": intent,
+            "conclusion": conclusion,
+            "evidence": [
+                {
+                    "line": m.get("line"),
+                    "time": m.get("time"),
+                    "sender": m.get("sender"),
+                    "snippet": m.get("snippet") or _build_snippet(m.get("content", ""), _CHATLOG_EVIDENCE_SNIPPET_CHARS),
+                }
+                for m in selected
+            ],
+            "counter_evidence": [
+                {
+                    "line": m.get("line"),
+                    "time": m.get("time"),
+                    "sender": m.get("sender"),
+                    "snippet": m.get("snippet") or _build_snippet(m.get("content", ""), _CHATLOG_EVIDENCE_SNIPPET_CHARS),
+                }
+                for m in counter_selected
+            ],
+            "reasoning": f"证据主要集中在: {', '.join(topics_seen) or '相关对话'}。",
+            "gaps": gaps,
+            "confidence": confidence,
+        })
+
+    # Step: Optionally use LLM for intelligent analysis
+    llm_matrix = None
+    if use_llm_analysis and matrix:
+        cleaner = _get_cleaner()
+        poe_client = cleaner._get_poe_client()
+        if poe_client and poe_client.is_configured:
+            try:
+                llm_matrix = await cleaner.generate_evidence_matrix(
+                    matrix,  # Pass the basic matrix as dimension_evidence
+                    question,
+                    target_person,
+                )
+                if llm_matrix and llm_matrix.get("method") == "llm":
+                    # Merge LLM analysis into matrix
+                    llm_dims = {d.get("name"): d for d in llm_matrix.get("dimensions", [])}
+                    for m in matrix:
+                        llm_dim = llm_dims.get(m.get("dimension"))
+                        if llm_dim:
+                            m["conclusion"] = llm_dim.get("conclusion", m.get("conclusion"))
+                            m["reasoning"] = llm_dim.get("reasoning_chain", m.get("reasoning"))
+                            if llm_dim.get("gaps"):
+                                m["gaps"] = llm_dim.get("gaps")
+                            if llm_dim.get("confidence"):
+                                m["confidence"] = llm_dim.get("confidence")
+            except Exception as e:
+                print(f"[ANALYZE] LLM matrix generation failed: {e}")
+
+    data = {
+        "evidence_id": evidence_id,
+        "matrix": matrix,
+        "overview": {
+            "message_count": len(messages),
+            "sender_counts": sender_counts,
+            "target_person": target_person,
+        },
+        "framework": _task_sub_questions(_infer_task_type(question)),
+        "overall_conclusion": llm_matrix.get("overall_conclusion") if llm_matrix else None,
+        "evidence_quality": llm_matrix.get("evidence_quality") if llm_matrix else None,
+        "analysis_method": "llm" if (llm_matrix and llm_matrix.get("method") == "llm") else "rule_based",
+        "disclaimer": "分析仅基于聊天记录证据，不构成最终决策建议。",
+    }
+    meta = {
+        "available": True,
+        "source": "analysis",
+        "llm_used": bool(llm_matrix and llm_matrix.get("method") == "llm"),
+        "timing_ms": int((time.time() - started) * 1000),
+    }
+    return _success(data, meta=meta, tool_name="analyze_evidence")
 
 
 async def _search_person_impl(args: dict) -> dict:
     """Internal implementation of search_person."""
     person = args.get("person", "")
-    include_context = args.get("include_context", True)
-    
+    include_context = bool(args.get("include_context", False))
+    max_messages = min(int(args.get("max_messages", _CHATLOG_MAX_LIST_ITEMS)), 200)
+    context_before = min(int(args.get("context_before", 1)), 3)
+    context_after = min(int(args.get("context_after", 1)), 3)
+
     if not person:
-        return {
-            "content": [{
-                "type": "text",
-                "text": "错误：请提供人物名称。"
-            }]
-        }
-    
+        return _error(
+            "错误：请提供人物名称。",
+            meta={"source": "search_person"},
+            tool_name="search_person"
+        )
+
     loader = _get_loader()
-    
+
     if not loader.is_loaded:
         if not loader.load():
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": "错误：无法加载聊天记录文件"
-                }]
-            }
-    
-    # Get messages from this person
+            return _error(
+                "错误：无法加载聊天记录文件",
+                meta={"source": "search_person"},
+                tool_name="search_person"
+            )
+
     person_messages = loader.get_messages_by_sender(person)
-    
+
     if not person_messages:
-        return {
-            "content": [{
-                "type": "text",
-                "text": f"未找到「{person}」的消息记录。"
-            }]
-        }
-    
-    # Build result
-    output = f"## 关于「{person}」的消息记录\n\n"
-    output += f"**总消息数**: {len(person_messages)}\n"
-    output += f"---\n\n"
-    
+        return _success(
+            {
+                "person": person,
+                "messages": [],
+                "total_messages": 0,
+                "returned_count": 0,
+                "omitted_count": 0,
+                "next_cursor": None,
+            },
+            meta={"source": "search_person", "available": True},
+            tool_name="search_person"
+        )
+
+    line_numbers: List[int] = []
     if include_context:
-        # Get context for each message
-        all_line_numbers = set()
-        for msg in person_messages[:50]:  # Limit to avoid too much data
-            for ln in range(max(1, msg.line_number - 2), msg.line_number + 3):
-                all_line_numbers.add(ln)
-        
-        for ln in sorted(all_line_numbers):
-            msg = loader.get_message(ln)
-            if msg:
-                output += msg.format_simple() + "\n"
+        line_set = set()
+        for msg in person_messages[:max_messages]:
+            for ln in range(max(1, msg.line_number - context_before), msg.line_number + context_after + 1):
+                line_set.add(ln)
+        line_numbers = sorted(line_set)
     else:
-        # Just the person's messages
-        for msg in person_messages[:100]:
-            output += msg.format_simple() + "\n"
-    
-    return {
-        "content": [{
-            "type": "text",
-            "text": output
-        }]
+        line_numbers = [msg.line_number for msg in person_messages[:max_messages]]
+
+    items = []
+    for ln in line_numbers:
+        msg = loader.get_message(ln)
+        if msg:
+            items.append({
+                "line": msg.line_number,
+                "time": (msg.timestamp or "")[:19],
+                "sender": msg.sender or "未知",
+                "content": _build_snippet(msg.content or "", _CHATLOG_SNIPPET_CHARS),
+                "is_match": msg.sender == person,
+            })
+
+    limited, omitted_count, next_cursor = _truncate_list(
+        items,
+        max_messages,
+        cursor_prefix=f"person:{person}"
+    )
+
+    data = {
+        "person": person,
+        "messages": limited,
+        "total_messages": len(person_messages),
+        "returned_count": len(limited),
+        "omitted_count": omitted_count,
+        "next_cursor": next_cursor,
+        "include_context": include_context,
     }
+    meta = {
+        "available": True,
+        "source": "search_person",
+    }
+    return _success(data, meta=meta, tool_name="search_person")
 
 
 # Tool-decorated versions (for MCP)
@@ -1293,7 +2268,10 @@ async def get_chatlog_stats(args: dict) -> dict:
     "搜索特定人物的所有相关消息记录。",
     {
         "person": str,            # 人物名称
-        "include_context": bool   # 可选：是否包含上下文（默认true）
+        "include_context": bool,  # 可选：是否包含上下文（默认false）
+        "max_messages": int,
+        "context_before": int,
+        "context_after": int
     }
 )
 async def search_person(args: dict) -> dict:
@@ -1346,7 +2324,9 @@ async def search_by_keywords(args: dict) -> dict:
         "line_numbers": list,
         "context_before": int,
         "context_after": int,
-        "include_metadata": bool
+        "include_metadata": bool,
+        "max_messages": int,
+        "max_content_chars": int
     }
 )
 async def load_messages(args: dict) -> dict:
@@ -1404,6 +2384,56 @@ async def format_messages(args: dict) -> dict:
     return await _format_messages_impl(args)
 
 
+@tool(
+    "parse_task",
+    "解析用户问题为任务类型与证据维度计划。",
+    {
+        "question": str,
+        "target_person": str,
+        "use_llm": bool,
+        "max_dimensions": int
+    }
+)
+async def parse_task(args: dict) -> dict:
+    return await _parse_task_impl(args)
+
+
+@tool(
+    "retrieve_evidence",
+    "按维度检索证据，返回证据摘要与 evidence_id。",
+    {
+        "question": str,
+        "target_person": str,
+        "dimensions": list,
+        "max_per_dimension": int,
+        "max_total_messages": int,
+        "snippet_chars": int,
+        "context_before": int,
+        "context_after": int,
+        "use_semantic": bool,
+        "use_llm_plan": bool
+    }
+)
+async def retrieve_evidence(args: dict) -> dict:
+    return await _retrieve_evidence_impl(args)
+
+
+@tool(
+    "analyze_evidence",
+    "基于 evidence_id 或证据列表输出证据矩阵。",
+    {
+        "evidence_id": str,
+        "messages": list,
+        "question": str,
+        "target_person": str,
+        "dimensions": list,
+        "max_examples": int
+    }
+)
+async def analyze_evidence(args: dict) -> dict:
+    return await _analyze_evidence_impl(args)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MCP Server Creation
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1424,10 +2454,10 @@ def create_chatlog_mcp_server(chatlog_path: Optional[str] = None):
     if chatlog_path:
         _chatlog_loader = ChatlogLoader(chatlog_path)
     
-    return create_sdk_mcp_server(
-        name="chatlog",
-        version="1.0.0",
-        tools=[
+    tool_profile = os.getenv("CHATLOG_TOOL_PROFILE", "slim").lower()
+    core_tools = [parse_task, retrieve_evidence, analyze_evidence]
+    if tool_profile in ("full", "debug"):
+        tools = [
             get_chatlog_stats,
             search_person,
             list_topics,
@@ -1438,64 +2468,102 @@ def create_chatlog_mcp_server(chatlog_path: Optional[str] = None):
             search_semantic,
             filter_by_person,
             format_messages,
+            *core_tools,
         ]
+    elif tool_profile == "stats":
+        tools = [get_chatlog_stats, *core_tools]
+    else:
+        tools = core_tools
+
+    return create_sdk_mcp_server(
+        name="chatlog",
+        version="1.0.0",
+        tools=tools,
     )
 
 
 def get_chatlog_tools_info() -> List[Dict[str, str]]:
-    """Get information about available chatlog tools for documentation."""      
-    return [
+    """Get information about available chatlog tools for documentation."""
+    tool_profile = os.getenv("CHATLOG_TOOL_PROFILE", "slim").lower()
+    tools = [
         {
-            "name": "mcp__chatlog__get_chatlog_stats",
-            "description": "获取聊天记录统计信息",
-            "usage": "查看聊天记录概况时调用"
+            "name": "mcp__chatlog__parse_task",
+            "description": "解析问题为任务类型与证据维度计划",
+            "usage": "入口：生成证据维度计划"
         },
         {
-            "name": "mcp__chatlog__search_person",
-            "description": "搜索特定人物的消息记录",
-            "usage": "需要了解某个人的历史消息时调用"
+            "name": "mcp__chatlog__retrieve_evidence",
+            "description": "按维度检索证据并返回 evidence_id",
+            "usage": "检索证据摘要，避免大文本回传"
         },
         {
-            "name": "mcp__chatlog__list_topics",
-            "description": "列出聊天记录索引中的话题标签",
-            "usage": "了解可用话题范围时调用"
+            "name": "mcp__chatlog__analyze_evidence",
+            "description": "基于 evidence_id 产出证据矩阵",
+            "usage": "输出维度结论、证据与反证"
         },
-        {
-            "name": "mcp__chatlog__search_by_topics",
-            "description": "按话题标签返回匹配行号",
-            "usage": "已有话题标签时快速缩小范围"
-        },
-        {
-            "name": "mcp__chatlog__search_by_keywords",
-            "description": "按关键词检索消息行号",
-            "usage": "需要精确关键词匹配时调用"
-        },
-        {
-            "name": "mcp__chatlog__load_messages",
-            "description": "按行号加载消息与上下文",
-            "usage": "在已有行号时获取原始内容"
-        },
-        {
-            "name": "mcp__chatlog__expand_query",
-            "description": "将问题扩展为关键词和话题",
-            "usage": "问题模糊或需要话题建议时调用"
-        },
-        {
-            "name": "mcp__chatlog__search_semantic",
-            "description": "语义向量召回相似消息",
-            "usage": "语义检索或宽泛问题召回时调用"
-        },
-        {
-            "name": "mcp__chatlog__filter_by_person",
-            "description": "过滤与目标人物相关的消息",
-            "usage": "需要保证人名归因时调用"
-        },
-        {
-            "name": "mcp__chatlog__format_messages",
-            "description": "格式化消息列表为文本",
-            "usage": "需要固定格式输出时调用"
-        }
     ]
+
+    if tool_profile in ("full", "debug", "stats"):
+        tools = [
+            {
+                "name": "mcp__chatlog__get_chatlog_stats",
+                "description": "获取聊天记录统计信息",
+                "usage": "查看聊天记录概况时调用"
+            },
+            *tools,
+        ]
+
+    if tool_profile in ("full", "debug"):
+        tools = [
+            *tools,
+            {
+                "name": "mcp__chatlog__search_person",
+                "description": "搜索特定人物的消息记录",
+                "usage": "需要了解某个人的历史消息时调用"
+            },
+            {
+                "name": "mcp__chatlog__list_topics",
+                "description": "列出聊天记录索引中的话题标签",
+                "usage": "调试可用话题范围"
+            },
+            {
+                "name": "mcp__chatlog__search_by_topics",
+                "description": "按话题标签返回匹配行号",
+                "usage": "调试话题索引召回"
+            },
+            {
+                "name": "mcp__chatlog__search_by_keywords",
+                "description": "按关键词检索消息行号",
+                "usage": "调试关键词召回"
+            },
+            {
+                "name": "mcp__chatlog__load_messages",
+                "description": "按行号加载消息与上下文",
+                "usage": "调试消息加载"
+            },
+            {
+                "name": "mcp__chatlog__expand_query",
+                "description": "将问题扩展为关键词和话题",
+                "usage": "调试关键词/话题扩展"
+            },
+            {
+                "name": "mcp__chatlog__search_semantic",
+                "description": "语义向量召回相似消息",
+                "usage": "调试语义召回"
+            },
+            {
+                "name": "mcp__chatlog__filter_by_person",
+                "description": "过滤与目标人物相关的消息",
+                "usage": "调试人名归因"
+            },
+            {
+                "name": "mcp__chatlog__format_messages",
+                "description": "格式化消息列表为文本",
+                "usage": "调试格式化输出"
+            },
+        ]
+
+    return tools
 
 
 async def close_chatlog_clients() -> None:
@@ -1538,6 +2606,88 @@ def compose_chatlog_query_sync(
     if "content" in result and result["content"]:
         return result["content"][0].get("text", "")
     return str(result)
+
+
+def compose_chatlog_analysis_sync(
+    question: str,
+    target_person: Optional[str] = None,
+    max_dimensions: int = 4
+) -> str:
+    """Synchronous wrapper for the parse->retrieve->analyze flow."""
+    args = {
+        "question": question,
+        "target_person": target_person,
+        "max_dimensions": max_dimensions,
+    }
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    parse_result = loop.run_until_complete(_parse_task_impl(args))
+    parse_payload = _extract_payload(parse_result)
+    parse_data = parse_payload.get("data", {})
+    dimensions = parse_data.get("dimensions", []) or []
+
+    retrieve_result = loop.run_until_complete(_retrieve_evidence_impl({
+        "question": question,
+        "target_person": target_person,
+        "dimensions": dimensions,
+    }))
+    retrieve_payload = _extract_payload(retrieve_result)
+    retrieve_data = retrieve_payload.get("data", {})
+    evidence_id = retrieve_data.get("evidence_id")
+
+    analyze_result = loop.run_until_complete(_analyze_evidence_impl({
+        "evidence_id": evidence_id,
+        "question": question,
+        "target_person": target_person,
+        "dimensions": dimensions,
+    }))
+    analyze_payload = _extract_payload(analyze_result)
+    analyze_data = analyze_payload.get("data", {})
+
+    lines: List[str] = []
+    lines.append("## 证据分析")
+    lines.append("")
+    lines.append(f"**问题**: {question}")
+    if target_person:
+        lines.append(f"**目标人物**: {target_person}")
+    lines.append(f"**evidence_id**: {evidence_id or '无'}")
+    lines.append("")
+
+    for item in analyze_data.get("matrix", []):
+        lines.append(f"### {item.get('dimension', '未命名维度')}")
+        lines.append(f"- 结论: {item.get('conclusion', '')}")
+        lines.append(f"- 置信度: {item.get('confidence', '')}")
+        lines.append(f"- 推断: {item.get('reasoning', '')}")
+        gaps = item.get("gaps") or []
+        if gaps:
+            lines.append(f"- 缺口: {', '.join(gaps)}")
+
+        evidence = item.get("evidence") or []
+        if evidence:
+            lines.append("- 证据:")
+            for ev in evidence:
+                snippet = ev.get("snippet", "")
+                sender = ev.get("sender", "未知")
+                line_no = ev.get("line")
+                lines.append(f"  - [{line_no}] {sender}: {snippet}")
+
+        counter = item.get("counter_evidence") or []
+        if counter:
+            lines.append("- 反证:")
+            for ev in counter:
+                snippet = ev.get("snippet", "")
+                sender = ev.get("sender", "未知")
+                line_no = ev.get("line")
+                lines.append(f"  - [{line_no}] {sender}: {snippet}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def get_chatlog_stats_sync() -> str:

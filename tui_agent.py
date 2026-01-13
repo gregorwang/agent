@@ -742,6 +742,19 @@ async def run_query(
                         response_iter.__anext__(),
                         timeout=RESPONSE_IDLE_TIMEOUT
                     )
+                    
+                    # DEBUG: 诊断Kimi响应格式
+                    console.print(f"\n[yellow]━━━ DEBUG MESSAGE ━━━[/yellow]")
+                    console.print(f"[yellow]Type: {type(message).__name__}[/yellow]")
+                    console.print(f"[yellow]Has reasoning_content: {hasattr(message, 'reasoning_content')}[/yellow]")
+                    if hasattr(message, 'reasoning_content'):
+                        reasoning = getattr(message, 'reasoning_content', '')
+                        preview = reasoning[:100] + '...' if len(reasoning) > 100 else reasoning
+                        console.print(f"[yellow]reasoning_content preview: {preview}[/yellow]")
+                    if hasattr(message, 'usage'):
+                        console.print(f"[yellow]Usage fields: {list(message.usage.__dict__.keys()) if hasattr(message.usage, '__dict__') else dir(message.usage)}[/yellow]")
+                    console.print(f"[yellow]━━━━━━━━━━━━━━━━━━━━[/yellow]\n")
+                    
                 except asyncio.TimeoutError:
                     live.stop()
                     console.print(
@@ -758,7 +771,22 @@ async def run_query(
                             session_manager.set_current_session_id(new_session_id)
                     continue
                 
+                
                 if isinstance(message, AssistantMessage):
+                    # DEBUG: 检查content blocks
+                    console.print(f"[magenta]━━━ ASSISTANT MESSAGE BLOCKS ━━━[/magenta]")
+                    console.print(f"[magenta]Total blocks: {len(message.content)}[/magenta]")
+                    for i, block in enumerate(message.content):
+                        block_type = type(block).__name__
+                        console.print(f"[magenta]Block {i}: {block_type}[/magenta]")
+                        if hasattr(block, 'text'):
+                            preview = block.text[:100] if len(block.text) > 100 else block.text
+                            console.print(f"[magenta]  Text preview: {preview}...[/magenta]")
+                        if hasattr(block, 'thinking'):
+                            preview = block.thinking[:100] if len(block.thinking) > 100 else block.thinking
+                            console.print(f"[magenta]  Thinking preview: {preview}...[/magenta]")
+                    console.print(f"[magenta]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/magenta]\n")
+                    
                     for block in message.content:
                         # P1 Fix: Handle ThinkingBlock for Extended Thinking (Opus 4.5)
                         if isinstance(block, ThinkingBlock):
@@ -809,8 +837,28 @@ async def run_query(
                     
                     # NEW: Extract token usage from ResultMessage
                     if hasattr(message, 'usage') and message.usage:
-                        stats.input_tokens += getattr(message.usage, 'input_tokens', 0)
-                        stats.output_tokens += getattr(message.usage, 'output_tokens', 0)
+                        # DEBUG: 诊断usage对象结构
+                        console.print(f"\n[cyan]━━━ USAGE DEBUG ━━━[/cyan]")
+                        console.print(f"[cyan]Usage type: {type(message.usage)}[/cyan]")
+                        
+                        # 打印实际内容
+                        if isinstance(message.usage, dict):
+                            console.print(f"[cyan]Usage dict content: {message.usage}[/cyan]")
+                            # 从字典提取
+                            input_tok = message.usage.get('input_tokens') or message.usage.get('prompt_tokens', 0)
+                            output_tok = message.usage.get('output_tokens') or message.usage.get('completion_tokens', 0)
+                        else:
+                            # 对象格式
+                            if hasattr(message.usage, '__dict__'):
+                                console.print(f"[cyan]Usage __dict__: {message.usage.__dict__}[/cyan]")
+                            input_tok = getattr(message.usage, 'input_tokens', None) or getattr(message.usage, 'prompt_tokens', 0)
+                            output_tok = getattr(message.usage, 'output_tokens', None) or getattr(message.usage, 'completion_tokens', 0)
+                        
+                        console.print(f"[cyan]Extracted: input={input_tok}, output={output_tok}[/cyan]")
+                        console.print(f"[cyan]━━━━━━━━━━━━━━━━━━[/cyan]\n")
+                        
+                        stats.input_tokens += input_tok
+                        stats.output_tokens += output_tok
                     if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
                         stats.total_cost_usd += message.total_cost_usd
                     
@@ -1067,9 +1115,7 @@ async def main() -> None:
         _render_context_status_bar()
         try:
             with patch_stdout():
-                prompt_label = f'[INPUT] ❯ '
-                pad = max(0, (console.width - len(prompt_label)) // 2)
-                prompt_text = f"{' ' * pad}<style fg=\"{COLORS['primary']}\">[INPUT]</style> ❯ "
+                prompt_text = f"<style fg=\"{COLORS['primary']}\">[INPUT]</style> ❯ "
                 text = await session.prompt_async(
                     HTML(prompt_text),
                     bottom_toolbar=HTML(
@@ -1319,7 +1365,7 @@ async def main() -> None:
             
             if command == "/chatlog":
                 # /chatlog [query|stats|person] [args]
-                from src.chatlog import compose_chatlog_query_sync, get_chatlog_stats_sync
+                from src.chatlog import compose_chatlog_analysis_sync, get_chatlog_stats_sync
                 from src.chatlog.loader import get_chatlog_loader
                 
                 subparts = arg.strip().split(maxsplit=1)
@@ -1342,10 +1388,10 @@ async def main() -> None:
                             chatlog_arg = parts[0].strip()
                             target_person = parts[1].split()[0] if parts[1] else None
                         
-                        result = compose_chatlog_query_sync(
+                        result = compose_chatlog_analysis_sync(
                             question=chatlog_arg,
                             target_person=target_person,
-                            max_results=100
+                            max_dimensions=4
                         )
                         console.print(Markdown(result))
                     else:
@@ -1521,9 +1567,9 @@ async def main() -> None:
                     client = None
                 reconnect = True
                 # Create brand new session ID
-                    resume_session_id = session_manager.create_session()
-                    session_start_time = datetime.now(timezone.utc)
-                    os.system("cls" if os.name == "nt" else "clear")
+                resume_session_id = session_manager.create_session()
+                session_start_time = datetime.now(timezone.utc)
+                os.system("cls" if os.name == "nt" else "clear")
                 print_dashboard(model)
                 console.print(f"[{COLORS['success']}]✓ 上下文已清除，新会话: {resume_session_id[:16]}...[/{COLORS['success']}]")
                 continue
